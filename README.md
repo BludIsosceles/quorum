@@ -79,6 +79,11 @@ operations. Companion tool: [`dissent`](https://github.com/BludIsosceles/dissent
 the same principle to citations.
 
 Build log: https://proiso.org/delta
+Contact: delta@proiso.org
+
+**Found a case this gets wrong?** That is the most useful thing you can send. Delta publishes
+its own failures and the corpus is open — a case that breaks the tool improves it, and it will
+be credited and published whether or not it flatters us.
 
 ## License
 

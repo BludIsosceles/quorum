@@ -66,6 +66,17 @@ class Harness:
         return [a.replace("{prompt}", prompt) for a in self.argv]
 
 
+# A routed alias (qodercli "Ultimate", "Auto", ...) picks a model per request from a
+# catalog spanning several families -- Qwen, Kimi, GLM, DeepSeek, MiniMax on the
+# 2026-10-07 listing. Its family is not knowable at dispatch, so a lane served
+# through one carries ROUTED rather than a guessed family. Labelling it "qwen", as
+# this roster did, let the independence check trust a claim nobody could verify:
+# an Ultimate verifier could be Kimi-K3 checking k3 work, with no error raised.
+# Reported by the Decatron desk (review-3 roster note); this is the stopgap until
+# per-model family slots (U-5) exist.
+ROUTED = "routed-unknown"
+
+
 # Empirical roster. Every field below was established by probe or by failure
 # during Delta's first operations — not copied from vendor documentation.
 ROSTER: dict[str, Harness] = {
@@ -90,13 +101,13 @@ ROSTER: dict[str, Harness] = {
               "— give it an explicit compose deadline."),
     "qoder": Harness(
         "qoder", "qwen",
-        ["qodercli", "-m", "Qwen3.8-Max-Preview", "-p", "{prompt}",
+        ["qodercli", "-m", "Qwen3.8-Max", "-p", "{prompt}",
          "--print", "--max-output-tokens", "8000", "--no-session-persistence"],
         web=True, shell=True, cost="cheap",
         notes="Buffers output until process exit — an empty file means running, "
               "not failed. Has stalled on shell-heavy dispatches."),
     "qoder-ultimate": Harness(
-        "qoder-ultimate", "qwen",
+        "qoder-ultimate", ROUTED,
         ["qodercli", "-m", "Ultimate", "-p", "{prompt}",
          "--print", "--max-output-tokens", "8000", "--no-session-persistence"],
         web=True, shell=True, cost="free",
@@ -106,6 +117,8 @@ ROSTER: dict[str, Harness] = {
 
 # The Overseer's own family. Anything Delta authors is checked by something else.
 OVERSEER_FAMILY = "anthropic"
+
+
 
 
 class IndependenceError(RuntimeError):
@@ -206,6 +219,12 @@ class Op:
             target = self.jobs.get(verifies)
             if target is None:
                 raise KeyError(f"cannot verify unknown job {verifies!r}")
+            if ROUTED in (h.family, target["family"]):
+                raise IndependenceError(
+                    f"{harness} (family={h.family}) verifying {verifies} "
+                    f"(family={target['family']}): a routed alias serves several families and "
+                    f"its family is unknowable at dispatch, so independence cannot be "
+                    f"established. Use a lane pinned to one model.")
             if h.family == target["family"]:
                 raise IndependenceError(
                     f"{harness} (family={h.family}) may not verify {verifies} "

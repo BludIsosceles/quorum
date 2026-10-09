@@ -28,6 +28,8 @@ def check(name, fn):
     saved = copy.deepcopy(ROSTER)                          # U-6 + grok S3: objects, not just keys
     saved_tab, saved_rec = list(MODEL_FAMILIES), copy.deepcopy(PROBE_RECIPES)
     saved_alias = set(quorum.ROUTED_ALIASES)
+    saved_more = copy.deepcopy((quorum.LINEAGE_TOKENS, quorum.VENDOR_FAMILIES,
+                                quorum.UNRESOLVABLE, quorum.UNRESOLVABLE_VENDORS))
     try:
         fn(); print(f"  PASS  {name}")
     except AssertionError as e:
@@ -39,6 +41,9 @@ def check(name, fn):
         MODEL_FAMILIES[:] = saved_tab
         PROBE_RECIPES.clear(); PROBE_RECIPES.update(saved_rec)
         quorum.ROUTED_ALIASES.clear(); quorum.ROUTED_ALIASES.update(saved_alias)
+        for live, kept in zip((quorum.LINEAGE_TOKENS, quorum.VENDOR_FAMILIES,
+                               quorum.UNRESOLVABLE, quorum.UNRESOLVABLE_VENDORS), saved_more):
+            live.clear(); (live.update if isinstance(live, dict) else live.extend)(kept)
 
 def run(name, body):
     def wrapped():
@@ -160,12 +165,12 @@ def unrecognised_model_refused(root):
 FLEET = {
     "swe-1-7": "swe", "gemini-3.6-flash-high": "gemini", "Qwen3.8-Max": "qwen", "kimi-code/k3": "k3",
     "kimi-code/kimi-for-coding": "k3", "meta/llama-3.1-70b-instruct": "meta", "openai/gpt-oss-120b": "openai",
-    "nvidia/nemotron-3-super-120b-a12b": "nemotron", "thinkingmachines/inkling": "inkling",
+    "nvidia/nemotron-3-super-120b-a12b": "nemotron", "thinkingmachines/inkling": UNKNOWN,
     "nvidia/nemotron-3-ultra-550b-a55b": "nemotron", "nvidia/nemotron-3-ultra-550b-a55b:free": "nemotron",
     "google/diffusiongemma-26b-a4b-it": "gemini", "nvidia/nemotron-3.5-lightning-30b-a3b": "nemotron",
     "meta/muse-glimmer-30b": "meta", "poolside/laguna-s-2.1:free": "laguna", "inception/mercury-2.5": "inception",
     "bytedance-seed/seed-1.6-flash": "seed", "bytedance-seed/seed-2-1-turbo": "seed", "gemma-4-31b-it": "gemini",
-    "inclusionai/ling-3.0-flash": "ling", "upstage/solar-pro4": "solar", "amazon/nova-lite-v1": "nova",
+    "inclusionai/ling-3.0-flash": "ling", "upstage/solar-pro4": UNKNOWN, "amazon/nova-lite-v1": "nova",
     "xiaomi/mimo-v2.5": "mimo", "tencent/hy3": "hunyuan", "mistralai/mistral-large-4-0": "mistral",
     "claude-opus-5-5": "anthropic", "gpt-6-astra": "openai", "gpt-5.3-codex": "openai", "grok-4.7": "grok",
     "glm-5.3": "glm", "deepseek-v4-pro": "deepseek", "minimax-m3": "minimax", "Ultimate": ROUTED,
@@ -178,15 +183,36 @@ def fleet_coverage(root):
 
 def unresolvable_ids_say_why(root):
     for m, word in (("stealth/ox-alpha", "undisclosed"), ("stealth/claude-opus-5-5", "undisclosed"),
-                    ("mistralai/mistral-nemotron", "jointly")):
+                    ("foo/stealth/claude-opus-5-5", "undisclosed"), ("stealth/nested/ox-alpha", "undisclosed"),
+                    ("mistralai/mistral-nemotron", "two lineages"), ("upstage/solar-pro4", "Phi-3"),
+                    ("nvidia/qwen3-finetune", "vendor path"), ("thinkingmachines/inkling", "not in")):
         r = resolve(Harness("x", "glm", ["x", "--model", m], True, True, "free"))
         assert r.family == UNKNOWN and word in r.why, (m, r)
+
+def derived_and_joint_ids_are_unknown(root):
+    for m in ("mistralai/mistral-nemotron", "nemotron-mistral-1", "nvidia/llama-3.1-nemotron-ultra-253b",
+              "qwen3-nemotron-32b", "deepseek-r1-distill-qwen-32b", "deepseek-r1-distill-llama-70b",
+              "gemma-claude-x", "gpt-oss-qwen-merge", "nvidia/qwen3-finetune", "google/llama-4-x",
+              "nemotron-qwen3-32b", "mistral-llama3-x", "deepseek-r1-distill-qwen2.5-7b"):
+        assert quorum.model_family(m) == UNKNOWN, f"{m} resolved {quorum.model_family(m)!r}"
 
 def lab_rule_merges(root):
     for a, b in (("gemma-4-31b-it", "gemini-3.6-flash-high"), ("meta/muse-glimmer-30b", "meta/llama-3.1-70b-instruct"),
                  ("openai/gpt-oss-120b", "gpt-6-astra"), ("kimi-code/kimi-for-coding", "kimi-code/k3")):
         fa, fb = quorum.model_family(a), quorum.model_family(b)
         assert fa == fb != UNKNOWN, f"{a}={fa} vs {b}={fb}: one lab, two families"
+
+def odd_long_flags_are_unparsed(root):
+    for a in ("--modelKimi-K3", "--model-provider", "-mKimi-K3"):
+        r = resolve(Harness("x", "qwen", ["x", "-m", "Qwen3.8-Max", a, "y"], True, True, "free"))
+        assert r.family == UNKNOWN, f"{a} beside a parsed pin resolved {r.family!r}"
+
+def blocked_job_cannot_be_verified(root):
+    o = setup(root); o.jobs["w"]["blocked"] = True
+    try:
+        o.dispatch("m", "x", "b", verifies="w"); raise AssertionError("a BLOCKED job was verified")
+    except ValueError as e:
+        assert "BLOCKED" in str(e), e
 
 def dash_m_equals_is_a_pin(root):
     assert resolve(Harness("x", "qwen", ["x", "-m=Qwen3.8-Max"], True, True, "free")).family == "qwen"
@@ -358,6 +384,9 @@ for n, f in [
     ("engine fleet pins all resolve as ruled",      fleet_coverage),
     ("unresolvable ids say why",                    unresolvable_ids_say_why),
     ("one lab is one family",                       lab_rule_merges),
+    ("joint and derived ids are unknown",           derived_and_joint_ids_are_unknown),
+    ("odd long model flags are unparsed",           odd_long_flags_are_unparsed),
+    ("a BLOCKED job cannot be verified",            blocked_job_cannot_be_verified),
     ("-m=ID is a pin",                              dash_m_equals_is_a_pin),
     ("timed-out partial output is BLOCKED",         timed_out_output_is_blocked),
     ("edited job record refused [Mismatch]",        edited_job_record_refused),

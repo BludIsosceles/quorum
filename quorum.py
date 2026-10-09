@@ -110,13 +110,19 @@ ROUTED_ALIASES = {"auto", "ultimate", "performance", "efficient", "lite", "sonus
 # and Muse are both Meta's, gpt-oss is OpenAI's. That is the conservative reading,
 # and the one this table already applied to Claude/Opus and to Kimi K2/K3.
 #
-# Each entry is a regex matched (re.match, so anchored at the start) against the
-# normalised id with any vendor prefix ("nvidia/", "kimi-code/") removed. v0.2.0
-# used bare startswith prefixes; "gpt", "opus" and "swe-" could claim ids they
-# merely prefix (grok-47 and gpt-5.6-luna reads), so patterns now end on a digit,
-# a separator, or the end of the id. First match wins. An id no entry matches is
-# UNKNOWN and refused, never defaulted. Extend it for your own lanes. Coverage was
-# extended 2026-10-09 to every pin the Decatron engine fields.
+# A table entry is a regex matched at the START of the normalised id after its
+# vendor path ("nvidia/", "kimi-code/") is removed; it names the id's leading model
+# line. First match wins. v0.2.0 used bare prefixes, and "gpt", "opus" and "swe-"
+# claimed ids they merely began with; entries now require a separator or digit
+# after the name. An id no entry matches is UNKNOWN and refused, never defaulted.
+#
+# The leading name is necessary, NOT sufficient: classify() also refuses an id
+# whose other name tokens (LINEAGE_TOKENS) or whose vendor path (VENDOR_FAMILIES)
+# point at a different lab. A joint or derived model such as mistral-nemotron,
+# llama-3.1-nemotron or deepseek-r1-distill-qwen carries two lineages, and a name
+# prefix cannot say which one decides its blind spots (gpt-5.6-luna read of v0.3).
+# Entries are only for lineages the maintainer can vouch for; everything else stays
+# unknown. Coverage extended 2026-10-09 to the pins the Decatron engine fields.
 MODEL_FAMILIES: list[tuple[str, str]] = [
     ("qwen\\d", "qwen"),
     ("kimi-", "k3"), ("k3$", "k3"),                          # Moonshot; K2.x and K3 are one family
@@ -132,23 +138,47 @@ MODEL_FAMILIES: list[tuple[str, str]] = [
     ("nemotron-", "nemotron"),                               # NVIDIA
     ("mistral-", "mistral"),
     ("mercury-", "inception"),
-    ("seed-", "seed"),                                       # ByteDance Seed
+    ("seed-", "seed"), ("doubao-", "seed"),                  # ByteDance Seed
     ("nova-", "nova"),                                       # Amazon
-    ("solar-", "solar"),                                     # Upstage
     ("hy\\d", "hunyuan"), ("hunyuan-", "hunyuan"),             # Tencent
     ("laguna-", "laguna"),                                   # Poolside
     ("ling-", "ling"),                                       # inclusionAI
     ("mimo-", "mimo"),                                       # Xiaomi
-    ("inkling$", "inkling"),                                 # Thinking Machines
 ]
 
 # Ids whose family cannot be established however the table grows. Checked first.
 UNRESOLVABLE: list[tuple[str, str]] = [
-    ("mistral-nemotron", "trained jointly by Mistral and NVIDIA, so it belongs to two families; "
-                         "independence from either cannot be shown"),
+    ("solar(-|$)", "Solar releases have been built on other labs' base models (Solar 10.7B "
+                   "from Mistral 7B weights, Solar Pro on Phi-3), so a given release's lineage "
+                   "is not established by its name"),
 ]
 UNRESOLVABLE_VENDORS = {
     "stealth": "a stealth model's lab is undisclosed by definition",
+}
+
+# Name tokens that identify a lab's model line wherever they appear in an id. If any
+# token names a lab other than the leading one, the id carries two lineages.
+LINEAGE_TOKENS = {
+    "qwen": "qwen", "qwq": "qwen", "kimi": "k3", "k3": "k3", "glm": "glm", "deepseek": "deepseek",
+    "minimax": "minimax", "gemini": "gemini", "gemma": "gemini", "diffusiongemma": "gemini",
+    "claude": "anthropic", "opus": "anthropic", "sonnet": "anthropic", "haiku": "anthropic",
+    "fable": "anthropic", "gpt": "openai", "codex": "openai", "grok": "grok", "llama": "meta",
+    "muse": "meta", "nemotron": "nemotron", "mistral": "mistral", "mixtral": "mistral",
+    "mercury": "inception", "seed": "seed", "doubao": "seed", "nova": "nova", "solar": "solar",
+    "hunyuan": "hunyuan", "laguna": "laguna", "ling": "ling", "mimo": "mimo", "phi": "microsoft",
+    "swe": "swe",
+}
+
+# Vendor namespaces (OpenRouter / NIM style) whose models come from one lab. A known
+# vendor serving a model line of another lab (nvidia/<a qwen fine-tune>) is two lineages.
+VENDOR_FAMILIES = {
+    "openai": "openai", "google": "gemini", "meta": "meta", "meta-llama": "meta", "nvidia": "nemotron",
+    "mistralai": "mistral", "anthropic": "anthropic", "x-ai": "grok", "qwen": "qwen",
+    "moonshotai": "k3", "deepseek": "deepseek", "deepseek-ai": "deepseek", "z-ai": "glm",
+    "zai-org": "glm", "thudm": "glm", "minimax": "minimax", "minimaxai": "minimax",
+    "bytedance-seed": "seed", "bytedance": "seed", "amazon": "nova", "tencent": "hunyuan",
+    "poolside": "laguna", "inclusionai": "ling", "xiaomi": "mimo", "inception": "inception",
+    "microsoft": "microsoft",
 }
 
 
@@ -159,9 +189,10 @@ def norm(family: str) -> str:
 
 
 # Spellings a CLI might read as a model flag that this parser does not take apart
-# ("-mKimi-K3", "--model Kimi-K3" as one element, "-m=X"). Rather than guess which one
-# the CLI honours, their presence makes the pin ambiguous.
-UNPARSED_PIN = re.compile(r"^(-m\S|-m\s|--model\s)")
+# ("-mKimi-K3", "--model Kimi-K3" as one element, "--modelX"). -m=X and --model=X ARE
+# parsed, before this check. Rather than guess which spelling the CLI honours, an
+# unparsed one makes the pin ambiguous.
+UNPARSED_PIN = re.compile(r"^(-m[^=\s]|-m\s|--model[^=\s]|--model\s)")
 
 
 def pinned_models(argv) -> list[str]:
@@ -178,32 +209,49 @@ def pinned_models(argv) -> list[str]:
     return out
 
 
-def _split(model: str) -> tuple[str, str]:
-    m = norm(model)
-    return (m.split("/", 1)[0] if "/" in m else ""), m.rsplit("/", 1)[-1]
+def _split(model: str) -> tuple[list[str], str]:
+    parts = norm(model).split("/")
+    return parts[:-1], parts[-1]
+
+
+def _token_family(tok: str) -> str | None:
+    if tok in LINEAGE_TOKENS:
+        return LINEAGE_TOKENS[tok]
+    base = re.sub(r"\d.*$", "", tok)          # qwen3 -> qwen
+    return LINEAGE_TOKENS.get(base) if base else None
+
+
+def classify(model: str) -> tuple[str, str]:
+    """(family, why) for one model id. family is concrete, ROUTED, or UNKNOWN."""
+    vendors, tail = _split(model)
+    if tail in ROUTED_ALIASES:
+        return ROUTED, "a routed alias"
+    for v in vendors:                        # every path segment, not only the first
+        if v in UNRESOLVABLE_VENDORS:
+            return UNKNOWN, UNRESOLVABLE_VENDORS[v]
+    for pat, why in UNRESOLVABLE:
+        if re.match(pat, tail):
+            return UNKNOWN, why
+    fam = next((f for pat, f in MODEL_FAMILIES if re.match(pat, tail)), UNKNOWN)
+    if fam == UNKNOWN:
+        return UNKNOWN, "not in MODEL_FAMILIES"
+    others = sorted({f for t in re.split(r"[-_.:+]+", tail)[1:] if (f := _token_family(t)) and f != fam})
+    if others:
+        return UNKNOWN, f"names two lineages ({fam} and {', '.join(others)}): a joint or derived model"
+    vf = sorted({VENDOR_FAMILIES[v] for v in vendors if v in VENDOR_FAMILIES and VENDOR_FAMILIES[v] != fam})
+    if vf:
+        return UNKNOWN, f"vendor path {'/'.join(vendors)} is {', '.join(vf)}; the model line is {fam}"
+    return fam, "pinned"
 
 
 def unresolvable(model: str) -> str | None:
-    """Why this id can never resolve to a family, or None."""
-    vendor, tail = _split(model)
-    if vendor in UNRESOLVABLE_VENDORS:
-        return UNRESOLVABLE_VENDORS[vendor]
-    for pat, why in UNRESOLVABLE:
-        if re.match(pat, tail):
-            return why
-    return None
+    """Why this id cannot resolve to a family, or None if it can."""
+    fam, why = classify(model)
+    return why if fam == UNKNOWN else None
 
 
 def model_family(model: str) -> str:
-    vendor, tail = _split(model)
-    if tail in ROUTED_ALIASES:
-        return ROUTED
-    if unresolvable(model):
-        return UNKNOWN
-    for pat, fam in MODEL_FAMILIES:
-        if re.match(pat, tail):
-            return fam
-    return UNKNOWN
+    return classify(model)[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -230,9 +278,7 @@ def resolve(h: "Harness") -> Resolution:
     if fam == ROUTED:
         return Resolution(ROUTED, model, f"pin {model!r} is a routed alias")
     if fam == UNKNOWN:
-        why = unresolvable(model)
-        return Resolution(UNKNOWN, model, f"pin {model!r}: {why}" if why
-                          else f"pin {model!r} is not in MODEL_FAMILIES")
+        return Resolution(UNKNOWN, model, f"pin {model!r}: {classify(model)[1]}")
     if fam != declared:
         return Resolution(UNKNOWN, model,
                           f"declared {h.family!r} but pin {model!r} is family {fam!r}")
@@ -540,6 +586,10 @@ class Op:
             # stored `family` field, and refuse if the two disagree: a record edited
             # after the fact, or a lane re-pointed between dispatches, is not the
             # thing that produced the work (grok-4.7, 2026-10-08).
+            if target.get("blocked"):
+                raise ValueError(
+                    f"job {verifies!r} is BLOCKED (no answer, or a timeout's partial output); "
+                    f"there is nothing to verify")
             th = ROSTER.get(target.get("harness", ""))
             if th is None:
                 raise RecordMismatchError(

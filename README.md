@@ -81,11 +81,24 @@ verification. Extend `MODEL_FAMILIES` for your own models.
 
 **A family is the lab that trained the model (v0.3).** Same lab means shared data and habits,
 and so shared blind spots. Under that rule Gemma resolves `gemini`, Llama and Muse are both
-`meta`, gpt-oss is `openai`, and Kimi K2 and K3 are one family. Some ids can never resolve,
-however the table grows (`UNRESOLVABLE`): a `stealth/` model has an undisclosed lab, and
-`mistral-nemotron` was trained jointly by two labs. Patterns are anchored (`gpt-\d`, not `gpt`),
-so an id that merely begins with a known name is not claimed. Since v0.3 the table covers every
-model the Decatron engine runs (82 lanes); the table names 22 labs.
+`meta`, gpt-oss is `openai`, and Kimi K2 and K3 are one family. Merging two labs only refuses
+more pairs; splitting one lab in two would let it check itself. So when in doubt, the table
+merges or refuses, never splits.
+
+**A name prefix cannot establish lineage**, so the leading name is necessary but not sufficient:
+- **Joint or derived models are refused.** If any other token in the id names a different
+  lab, the id is unknown: `mistral-nemotron`, `llama-3.1-nemotron-…`,
+  `deepseek-r1-distill-qwen-…`.
+- **The vendor must agree.** A known vendor serving another lab's model line (say
+  `nvidia/<qwen fine-tune>`) is unknown.
+- **`stealth` anywhere in the vendor path is unknown.** The lab is undisclosed.
+- **Solar is unknown.** Its releases have been built on other labs' bases.
+- **Only vouched-for lineages get an entry.** Anything else stays unknown until someone who
+  can vouch for its lineage adds it.
+
+Patterns are anchored (`gpt-\d`, not `gpt`). Since v0.3 the table covers the models the
+Decatron engine runs: 67 of its 82 lane labels agree, and the rest either need a relabel under
+the lab rule or fail closed on purpose.
 
 ## Probes record what they saw (v0.2)
 

@@ -198,6 +198,13 @@ def check_cli_matches_dispatch(root):
     assert subprocess.run([sys.executable, str(QDIR / "quorum.py"), "--check", "devin", "qwen",
                            "--overseer", "swe"], capture_output=True).returncode == 1, "--overseer ignored"
 
+def vet_takes_no_prebuilt_resolution(root):
+    try:
+        vet(ROSTER["qoder"], quorum.Resolution("made-up-family", None, "forged"))
+        raise AssertionError("a caller-built Resolution was trusted")
+    except TypeError:
+        pass
+
 def suggestions_are_usable(root):
     try:
         vet(ROSTER["qoder"], "qwen")
@@ -264,6 +271,8 @@ def probe_needs_positive_recognition(root):
     assert o.probe(["f"]) == {"f": False}, "a stale pin passed"
     fake.write_text("#!/bin/sh\necho MODEL\necho stuba-1\nexit 3\n")
     assert o.probe(["f"]) == {"f": False}, "recognised text with a failing exit passed"
+    fake.write_text("#!/bin/sh\necho stuba-1\necho 'not logged in'\nexit 3\n")
+    assert o.probe(["f"]) == {"f": False}, "nonzero exit passed because login text was present"
 
 def probe_without_recipe_is_declared_only(root):
     ROSTER["s"] = stub("s", "stuba", "stuba-1")
@@ -296,6 +305,7 @@ for n, f in [
     ("output changed after production refused",     output_changed_after_production_refused),
     ("unknown verify target refused",               unknown_target_refused),
     ("--check is the dispatch rule",                check_cli_matches_dispatch),
+    ("vet() takes no pre-built Resolution",         vet_takes_no_prebuilt_resolution),
     ("refusal suggestions are usable",              suggestions_are_usable),
     ("write-once path never reused",                write_once_holds),
     ("duplicate label refused; retry versions",     duplicate_label_refused_retry_versions),

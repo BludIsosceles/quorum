@@ -262,13 +262,17 @@ def _alternatives(target_family: str, overseer: str) -> list[str]:
                   if (f := resolve(x).family) not in (ROUTED, UNKNOWN, target_family, norm(overseer)))
 
 
-def vet(verifier: Harness, target: Resolution | str, overseer: str = OVERSEER_FAMILY) -> None:
-    """THE independence rule. Raises if `verifier` may not check work whose family is
-    `target`. dispatch() and the --check CLI both call this; there is no second copy
-    to drift (v0.1's --check allowed pairs dispatch refused)."""
+def vet(verifier: Harness, target: Harness | str, overseer: str = OVERSEER_FAMILY) -> None:
+    """THE independence rule. Raises if `verifier` may not check work produced by
+    `target` (a Harness, resolved here) or by a named family. dispatch() and the
+    --check CLI both call this; there is no second copy to drift (v0.1's --check
+    allowed pairs dispatch refused). It never accepts a pre-built Resolution: a
+    caller-supplied one bypassed the family table (luna confirmation read)."""
     v = resolve(verifier)
-    if isinstance(target, Resolution):
-        t = target
+    if isinstance(target, Harness):
+        t = resolve(target)
+    elif not isinstance(target, str):
+        raise TypeError(f"vet() target must be a Harness or a family name, not {type(target).__name__}")
     else:
         # A family given as a string must be one the table can produce. An arbitrary
         # string ("made-up-family", a typo) is not an established family, and v0.2's
@@ -442,8 +446,8 @@ class Op:
             text = out + "\n" + err
             if timed_out:
                 cls = "timeout"
-            elif code != 0 and not NOT_LOGGED_IN.search(text):
-                cls = "nonzero-exit"
+            elif code != 0:                         # never ok, whatever the text says
+                cls = "not-logged-in" if NOT_LOGGED_IN.search(text) else "nonzero-exit"
             elif expect == "{model}":
                 cls = ("ok" if model and any(ln.split()[:1] == [model] for ln in out.splitlines())
                        else "not-logged-in" if NOT_LOGGED_IN.search(text) else "model-not-offered"
@@ -505,7 +509,7 @@ class Op:
                     f"job {verifies!r}'s output is missing or changed since it was produced "
                     f"(recorded sha {target.get('sha')!r}); the verifier would not be checking "
                     f"the recorded work.")
-            vet(h, tres, self.overseer)
+            vet(h, th, self.overseer)
 
         if label in self.jobs:
             if not retry:
@@ -592,8 +596,8 @@ def main() -> int:
         h = ROSTER.get(name)
         if not h:
             print(f"unknown harness {name!r}"); return 2
-        target = resolve(ROSTER[tgt]) if tgt in ROSTER else tgt
-        tfam = target.family if isinstance(target, Resolution) else norm(tgt)
+        target = ROSTER[tgt] if tgt in ROSTER else tgt
+        tfam = resolve(target).family if isinstance(target, Harness) else norm(tgt)
         try:
             vet(h, target, a.overseer)
         except IndependenceError as e:

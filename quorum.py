@@ -129,14 +129,23 @@ def norm(family: str) -> str:
     return re.sub(r"[\s_]+", "-", str(family).strip().casefold())
 
 
+# Spellings a CLI might read as a model flag that this parser does not take apart
+# ("-mKimi-K3", "--model Kimi-K3" as one element, "-m=X"). Rather than guess which one
+# the CLI honours, their presence makes the pin ambiguous.
+UNPARSED_PIN = re.compile(r"^(-m\S|-m\s|--model\s)")
+
+
 def pinned_models(argv) -> list[str]:
-    """Every model named by -m/--model (or --model=) in argv."""
+    """Every model named by -m/--model (or --model=) in argv. An unparsed spelling
+    counts as a second, unknowable pin, so resolve() refuses the lane."""
     out, it = [], iter(argv)
     for a in it:
         if a in MODEL_FLAGS:
             out.append(next(it, ""))
         elif a.startswith("--model="):
             out.append(a.split("=", 1)[1])
+        elif UNPARSED_PIN.match(a):
+            out.append(f"<unparsed {a!r}>")
     return out
 
 
@@ -164,7 +173,7 @@ def resolve(h: "Harness") -> Resolution:
     model = pins[-1] if pins else None
     if declared == ROUTED:
         return Resolution(ROUTED, model, "declared routed")
-    if len({norm(x) for x in pins}) > 1:
+    if len({norm(x) for x in pins}) > 1 or any(x.startswith("<unparsed") for x in pins):
         return Resolution(UNKNOWN, model, f"argv pins several models {pins}")
     if model is None:
         return Resolution(UNKNOWN, None,
@@ -258,7 +267,17 @@ def vet(verifier: Harness, target: Resolution | str, overseer: str = OVERSEER_FA
     `target`. dispatch() and the --check CLI both call this; there is no second copy
     to drift (v0.1's --check allowed pairs dispatch refused)."""
     v = resolve(verifier)
-    t = target if isinstance(target, Resolution) else Resolution(norm(target), None, "given")
+    if isinstance(target, Resolution):
+        t = target
+    else:
+        # A family given as a string must be one the table can produce. An arbitrary
+        # string ("made-up-family", a typo) is not an established family, and v0.2's
+        # first cut allowed it (gpt-5.6-luna cross-family read, 2026-10-09).
+        f = norm(target)
+        known = {norm(x) for _, x in MODEL_FAMILIES}
+        t = Resolution(f if f in known | {ROUTED} else UNKNOWN, None,
+                       "given" if f in known | {ROUTED} else
+                       f"family {target!r} is not one MODEL_FAMILIES can produce")
     if ROUTED in (v.family, t.family):
         side = "verifier" if v.family == ROUTED else "target"
         raise RoutedFamilyError(
@@ -316,8 +335,9 @@ def run_isolated(argv: list[str], timeout: float) -> tuple[int, str, str, bool]:
             pass
         try:
             out, err = p.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            out, err = "", ""
+        except subprocess.TimeoutExpired as e:      # a descendant escaped the group and holds the pipe
+            dec = lambda b: b.decode(errors="replace") if isinstance(b, bytes) else (b or "")
+            out, err = dec(e.stdout), dec(e.stderr) + "\n[quorum] pipe still held after group kill"
         return -9, out or "", (err or "") + f"\n[quorum] timeout after {timeout}s; process group killed", True
 
 
@@ -422,6 +442,8 @@ class Op:
             text = out + "\n" + err
             if timed_out:
                 cls = "timeout"
+            elif code != 0 and not NOT_LOGGED_IN.search(text):
+                cls = "nonzero-exit"
             elif expect == "{model}":
                 cls = ("ok" if model and any(ln.split()[:1] == [model] for ln in out.splitlines())
                        else "not-logged-in" if NOT_LOGGED_IN.search(text) else "model-not-offered"
@@ -471,12 +493,18 @@ class Op:
                     f"job {verifies!r} names harness {target.get('harness')!r}, which is not in "
                     f"the roster; what produced it cannot be established.")
             tres = resolve(th)
-            if norm(target.get("family", "")) != tres.family or (
-                    "argv" in target and tuple(target["argv"]) != th.argv):
+            if norm(target.get("family", "")) != tres.family or \
+                    tuple(target.get("argv") or ()) != th.argv:
                 raise RecordMismatchError(
                     f"job {verifies!r} records family={target.get('family')!r} but its harness "
                     f"{th.name} now resolves to {tres.family!r} ({tres.why}); the record and the "
                     f"roster disagree, so independence cannot be established.")
+            outp = pathlib.Path(target.get("output", ""))
+            if not target.get("sha") or not outp.is_file() or self._sha(outp) != target["sha"]:
+                raise RecordMismatchError(
+                    f"job {verifies!r}'s output is missing or changed since it was produced "
+                    f"(recorded sha {target.get('sha')!r}); the verifier would not be checking "
+                    f"the recorded work.")
             vet(h, tres, self.overseer)
 
         if label in self.jobs:
@@ -512,7 +540,7 @@ class Op:
         # gets ignored, which is the failure mode it exists to prevent.
         blocked = size < min_bytes
         job = {"label": label, "harness": harness, "family": res.family, "model": res.model,
-               "argv": list(h.argv), "role": role, "timed_out": timed_out,
+               "argv": list(h.argv), "sha": self._sha(out), "role": role, "timed_out": timed_out,
                "output": str(out), "bytes": size, "exit": code, "blocked": blocked,
                "secs": round(time.time() - t0), "verifies": verifies}
         self.jobs[label] = job

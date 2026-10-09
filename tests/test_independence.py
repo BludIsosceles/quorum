@@ -27,6 +27,7 @@ FAILS = []
 def check(name, fn):
     saved = copy.deepcopy(ROSTER)                          # U-6 + grok S3: objects, not just keys
     saved_tab, saved_rec = list(MODEL_FAMILIES), copy.deepcopy(PROBE_RECIPES)
+    saved_alias = set(quorum.ROUTED_ALIASES)
     try:
         fn(); print(f"  PASS  {name}")
     except AssertionError as e:
@@ -37,6 +38,7 @@ def check(name, fn):
         ROSTER.clear(); ROSTER.update(saved)
         MODEL_FAMILIES[:] = saved_tab
         PROBE_RECIPES.clear(); PROBE_RECIPES.update(saved_rec)
+        quorum.ROUTED_ALIASES.clear(); quorum.ROUTED_ALIASES.update(saved_alias)
 
 def run(name, body):
     def wrapped():
@@ -134,6 +136,14 @@ def unpinned_lane_refused(root):
     o = setup(root)
     refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "kimi", verifies="w"), "unpinned kimi")
 
+def odd_pin_spellings_refused(root):
+    for argv in (["x", "-mKimi-K3", "-m", "Qwen3.8-Max"], ["x", "-m", "Qwen3.8-Max", "--model Kimi-K3"],
+                 ["x", "-m", "Qwen3.8-Max", "--model=Kimi-K3"], ["x", "-m", "Qwen3.8-Max", "-m", "GLM-5.3"]):
+        r = resolve(Harness("o", "qwen", argv, True, True, "free"))
+        assert r.family == UNKNOWN, f"{argv} resolved {r.family!r}"
+    assert resolve(Harness("o", "qwen", ["x", "--max-output-tokens", "8", "-m", "Qwen3.8-Max"],
+                           True, True, "free")).family == "qwen", "a non-model flag broke the pin"
+
 def label_contradicting_pin_refused(root):
     o = setup(root); ROSTER["liar"] = stub("liar", "stubb", "stuba-9")   # says stubb, runs stuba
     refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "liar", verifies="w"), "label vs pin")
@@ -158,6 +168,14 @@ def producer_repointed_between_dispatches(root):
     o = setup(root); ROSTER["a"] = stub("a", "stuba", "stuba-2")        # same label, new pin
     refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="w"), "lane re-pointed")
 
+def forged_record_without_argv_refused(root):
+    o = setup(root); j = dict(o.jobs["w"]); del j["argv"]; o.jobs["f"] = j
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="f"), "record with no argv")
+
+def output_changed_after_production_refused(root):
+    o = setup(root); pathlib.Path(o.jobs["w"]["output"]).write_text("swapped")
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="w"), "output swapped")
+
 def unknown_target_refused(root):
     try:
         setup(root).dispatch("m", "x", "b", verifies="nope")
@@ -172,7 +190,9 @@ def check_cli_matches_dispatch(root):
                               capture_output=True, text=True).returncode
     cases = {("qoder-ultimate", "k3"): 1, ("qoder-ultimate", "qwen"): 1, ("devin", "routed-unknown"): 1,
              ("kimi", "swe"): 1, ("devin", "K3 "): 0, ("devin", "SWE"): 1, ("qoder", "agy"): 0,
-             ("qoder", "qoder-ultimate"): 1, ("devin", "gemini"): 0}
+             ("qoder", "qoder-ultimate"): 1, ("devin", "gemini"): 0,
+             ("qoder", "made-up-family"): 1, ("qoder", "qwen3"): 1,
+             ("qoder", "anthropic"): 0}       # Claude-authored work checked by Qwen: the point
     bad = {k: (cli(*k), v) for k, v in cases.items() if cli(*k) != v}
     assert not bad, f"--check disagrees with the rule: {bad}"
     assert subprocess.run([sys.executable, str(QDIR / "quorum.py"), "--check", "devin", "qwen",
@@ -242,6 +262,8 @@ def probe_needs_positive_recognition(root):
     assert o.probe(["f"]) == {"f": True}, "a live catalog offering the pin failed"
     fake.write_text("#!/bin/sh\necho MODEL\necho stuba-2\n")
     assert o.probe(["f"]) == {"f": False}, "a stale pin passed"
+    fake.write_text("#!/bin/sh\necho MODEL\necho stuba-1\nexit 3\n")
+    assert o.probe(["f"]) == {"f": False}, "recognised text with a failing exit passed"
 
 def probe_without_recipe_is_declared_only(root):
     ROSTER["s"] = stub("s", "stuba", "stuba-1")
@@ -264,11 +286,14 @@ for n, f in [
     ("routed label variants normalised",            routed_label_variants),
     ("argv pin cannot be edited in place",          argv_pin_cannot_be_edited),
     ("unpinned lane refused [Unknown]",             unpinned_lane_refused),
+    ("odd pin spellings make the pin unknown",      odd_pin_spellings_refused),
     ("label contradicting pin refused [Unknown]",   label_contradicting_pin_refused),
     ("unrecognised model id refused [Unknown]",     unrecognised_model_refused),
     ("edited job record refused [Mismatch]",        edited_job_record_refused),
     ("hand-written routed record refused",          handwritten_routed_record_refused),
     ("producer re-pointed between dispatches",      producer_repointed_between_dispatches),
+    ("forged record without argv refused",          forged_record_without_argv_refused),
+    ("output changed after production refused",     output_changed_after_production_refused),
     ("unknown verify target refused",               unknown_target_refused),
     ("--check is the dispatch rule",                check_cli_matches_dispatch),
     ("refusal suggestions are usable",              suggestions_are_usable),

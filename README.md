@@ -66,8 +66,11 @@ verification when it is:
 | orchestrator's | verifier shares the overseer family | `OverseerFamilyError` |
 
 All five are `IndependenceError`s. When verifying, the producing job's harness is **re-resolved
-from the roster**, not read back from the job record; if the record and the roster disagree
-(edited record, or a lane re-pointed between dispatches), that is `RecordMismatchError`.
+from the roster**, not read back from the job record. If the record and the roster disagree
+(edited record, a record with no argv, a lane re-pointed between dispatches), or the output
+file no longer matches the hash recorded when it was produced, that is `RecordMismatchError`.
+A family given as a string (to `vet()` or `--check`) must be one the table can produce; an
+unrecognised string is `unknown`, not a new family.
 `quorum.py --check HARNESS TARGET` calls the same rule as `dispatch` (v0.1's CLI kept an older
 copy and allowed pairs dispatch refused). `TARGET` is a harness name or a family; `--overseer`
 sets the orchestrator family.
@@ -84,16 +87,16 @@ reads the claim instead of exercising the capability. One CLI printed `Not logge
 
 A probe now runs a per-CLI recipe (`PROBE_RECIPES`) and **passes only on positive recognition**:
 `devin auth status` must say `Logged in`, and each CLI's account-scoped model list must contain
-the lane's exact pin (a retired pin fails here). Exit status alone never passes; unrecognised
-output fails. A lane with no recipe is *declared-only* and fails unless `allow_declared=True`.
+the lane's exact pin (a retired pin fails here). A pass needs both exit 0 and the recognised
+content; exit status alone never passes, and unrecognised output fails. A lane with no recipe is *declared-only* and fails unless `allow_declared=True`.
 Each probe is logged as a dated observation: argv hash, binary fingerprint, a classification
 per check, and an output hash. Web access is still **declared, not exercised**, and the log says
 so.
 
 Dispatches and probes run with stdin closed, in their own process group, and a timeout kills
 the whole group. Agent CLIs spawn workers that survive a direct-child kill. A label is used once:
-reuse is refused unless `retry=True`, which keeps the superseded job in `op.attempts`. Prompts
-are versioned write-once, like outputs.
+reuse is refused unless `retry=True`, which keeps the superseded job in `op.attempts`. After a
+retry, `verifies=label` means the newest attempt. Prompts are versioned write-once, like outputs.
 
 ## The roster is the point
 

@@ -4,94 +4,281 @@
 v1 of this suite (2026-07-28) passed 5/5 on a host with NO agent binaries: its
 allowed-path case dispatched a live lane, quorum swallowed the FileNotFoundError,
 and the test only asserted that no IndependenceError was raised. Reported by the
-Decatron desk (U-1) and reproduced by Delta. A dispatch that could not happen was
-counted as a pass -- the exact "silence is a result, not a pass" failure quorum's
-own header names. v2: the allowed path runs a stub harness and asserts the
-dispatch actually ran; any unexpected exception is a recorded FAIL (U-6); ROSTER
-is restored after each mutation; temp dirs are cleaned.
+Decatron desk (U-1) and reproduced by Delta. v2 ran a stub harness and asserted
+the dispatch actually ran.
+
+v2 still accepted ANY IndependenceError as proof of the rule it named, so a
+routed lane relabelled into the same family passed "routed alias refused" for the
+wrong reason, and no test put a routed lane on the PRODUCING side (grok-4.7
+cross-family read, 2026-10-08). v3: every refusal asserts the exact rule that
+fired; each attack from that read is a test; ROSTER and the family table are
+deep-restored; no test dispatches a real agent CLI.
 """
-import pathlib, sys, tempfile, shutil
-sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+import copy, os, pathlib, subprocess, sys, tempfile, shutil, time, dataclasses
+QDIR = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(QDIR))
 import quorum
-from quorum import Op, ROSTER, IndependenceError, OVERSEER_FAMILY, ROUTED, Harness
+from quorum import (Op, ROSTER, IndependenceError, OVERSEER_FAMILY, ROUTED, UNKNOWN, Harness,
+                    RoutedFamilyError, UnknownFamilyError, SameFamilyError,
+                    OverseerFamilyError, RecordMismatchError, MODEL_FAMILIES, PROBE_RECIPES,
+                    resolve, vet)
 
 FAILS = []
 def check(name, fn):
-    saved = dict(ROSTER)
+    saved = copy.deepcopy(ROSTER)                          # U-6 + grok S3: objects, not just keys
+    saved_tab, saved_rec = list(MODEL_FAMILIES), copy.deepcopy(PROBE_RECIPES)
     try:
         fn(); print(f"  PASS  {name}")
     except AssertionError as e:
         FAILS.append(name); print(f"  FAIL  {name}: {e}")
-    except Exception as e:                       # U-6: a crash is a recorded failure
+    except Exception as e:                                 # U-6: a crash is a recorded failure
         FAILS.append(name); print(f"  FAIL  {name}: unexpected {type(e).__name__}: {e}")
     finally:
-        ROSTER.clear(); ROSTER.update(saved)     # U-6: no leaked lanes
-
-STUB = Harness("stub", "stubfam", ["bash", "-c", "echo stub-dispatch-ok #{prompt}"],
-               web=False, shell=True, cost="free")
-
-def _op(root):
-    o = Op("t", root=root)
-    o.jobs["w"] = {"label": "w", "family": "k3", "harness": "kimi", "role": "worker"}
-    return o
+        ROSTER.clear(); ROSTER.update(saved)
+        MODEL_FAMILIES[:] = saved_tab
+        PROBE_RECIPES.clear(); PROBE_RECIPES.update(saved_rec)
 
 def run(name, body):
     def wrapped():
-        with tempfile.TemporaryDirectory() as root:  # U-6: always cleaned
+        with tempfile.TemporaryDirectory() as root:      # U-6: always cleaned
             body(root)
     check(name, wrapped)
 
+def stub(name, family, model, script="echo stub-dispatch-ok #{prompt}"):
+    """A runnable lane: bash runs `script`; the trailing --model pin is what resolve()
+    reads (bash -c ignores it as $0/$1)."""
+    return Harness(name, family, ["bash", "-c", script, "--model", model],
+                   web=False, shell=True, cost="free")
+
+def setup(root):
+    """Two pinned stub families, A and B. Returns an Op holding a real job 'w' by A."""
+    MODEL_FAMILIES[:0] = [("stuba-", "stuba"), ("stubb-", "stubb")]
+    ROSTER["a"] = stub("a", "stuba", "stuba-1")
+    ROSTER["b"] = stub("b", "stubb", "stubb-1")
+    o = Op("t", root=root)
+    o.dispatch("w", "x", "a", min_bytes=1)
+    return o
+
+def refuses(exc, fn, msg):
+    try:
+        fn()
+    except IndependenceError as e:
+        assert type(e) is exc, f"{msg}: refused, but by {type(e).__name__}, not {exc.__name__}: {e}"
+        return
+    raise AssertionError(f"{msg}: ALLOWED")
+
+# --- the allowed path is real -------------------------------------------------------------
 def stub_is_runnable(root):
-    assert shutil.which("bash"), "bash not found -- the stub cannot run, so the allowed-path test would be vacuous"
-
-def same_family_refused(root):
-    try:
-        _op(root).dispatch("m", "x", "kimi", verifies="w")
-        raise AssertionError("k3 was ALLOWED to verify k3")
-    except IndependenceError:
-        pass
-
-def overseer_family_refused(root):
-    ROSTER["self"] = Harness("self", OVERSEER_FAMILY, ["true"], True, True, "paid")
-    try:
-        _op(root).dispatch("m", "x", "self", verifies="w")
-        raise AssertionError("the orchestrator's own family was allowed to verify")
-    except IndependenceError:
-        pass
-
-def routed_alias_refused(root):
-    try:
-        _op(root).dispatch("m", "x", "qoder-ultimate", verifies="w")
-        raise AssertionError("a routed alias was allowed to verify; its family is unknowable")
-    except IndependenceError:
-        pass
-
-def unknown_target_refused(root):
-    try:
-        _op(root).dispatch("m", "x", "devin", verifies="nope")
-        raise AssertionError("verifying an unknown job was allowed")
-    except KeyError:
-        pass
-
-def write_once_holds(root):
-    o = Op("t2", root=root)
-    a = o._path("x-output.md"); a.write_text("first")
-    assert o._path("x-output.md") != a, "second artifact would overwrite the first"
+    assert shutil.which("bash"), "bash not found -- the allowed-path tests would be vacuous"
 
 def cross_family_actually_dispatches(root):
-    ROSTER["stub"] = STUB
-    j = _op(root).dispatch("m", "x", "stub", verifies="w", min_bytes=1)
+    o = setup(root)
+    j = o.dispatch("m", "x", "b", verifies="w", min_bytes=1)
     assert j["exit"] == 0, f"stub dispatch did not run (exit {j['exit']})"
     assert not j["blocked"] and j["bytes"] > 0, "stub dispatch produced nothing"
     assert "stub-dispatch-ok" in pathlib.Path(j["output"]).read_text(), "output is not the stub's"
 
-print("quorum guard tests (v2)")
-run("stub harness is runnable",               stub_is_runnable)
-run("same family refused",                    same_family_refused)
-run("orchestrator's own family refused",      overseer_family_refused)
-run("routed alias refused as verifier",       routed_alias_refused)
-run("unknown verify target refused",          unknown_target_refused)
-run("write-once path never reused",           write_once_holds)
-run("cross-family dispatch ACTUALLY RUNS",    cross_family_actually_dispatches)
+# --- each rule, by name ------------------------------------------------------------------
+def same_family_refused(root):
+    o = setup(root); ROSTER["a2"] = stub("a2", "stuba", "stuba-2")
+    refuses(SameFamilyError, lambda: o.dispatch("m", "x", "a2", verifies="w"), "stuba verifying stuba")
+
+def same_family_ignores_case_and_space(root):
+    o = setup(root); ROSTER["a3"] = stub("a3", " STUBA ", "STUBA-3")
+    refuses(SameFamilyError, lambda: o.dispatch("m", "x", "a3", verifies="w"), "' STUBA ' verifying stuba")
+
+def overseer_family_refused(root):
+    o = setup(root); ROSTER["self"] = stub("self", OVERSEER_FAMILY, "claude-opus-5-5")
+    refuses(OverseerFamilyError, lambda: o.dispatch("m", "x", "self", verifies="w"), "overseer family")
+
+def explicit_overseer_is_used(root):
+    o = setup(root); o.overseer = "stubb"
+    refuses(OverseerFamilyError, lambda: o.dispatch("m", "x", "b", verifies="w"), "Op(overseer=stubb)")
+
+def routed_alias_refused_as_verifier(root):
+    o = setup(root)
+    refuses(RoutedFamilyError, lambda: o.dispatch("m", "x", "qoder-ultimate", verifies="w"),
+            "shipped qoder-ultimate as verifier")
+
+def routed_alias_refused_as_producer(root):
+    o = setup(root); ROSTER["r"] = stub("r", "stuba", "Ultimate")
+    j = o.dispatch("rw", "x", "r", min_bytes=1)
+    assert j["family"] == ROUTED, f"routed producer recorded as {j['family']!r}"
+    refuses(RoutedFamilyError, lambda: o.dispatch("m", "x", "b", verifies="rw"), "verifying routed work")
+
+def relabelled_routed_lane_still_routed(root):
+    ROSTER["qoder-ultimate"] = dataclasses.replace(ROSTER["qoder-ultimate"], family="qwen")
+    assert resolve(ROSTER["qoder-ultimate"]).family == ROUTED, "relabel to qwen hid the router"
+    o = setup(root)
+    refuses(RoutedFamilyError, lambda: o.dispatch("m", "x", "qoder-ultimate", verifies="w"), "relabelled")
+
+def new_lane_on_routed_alias_refused(root):
+    ROSTER["qoder-auto"] = Harness("qoder-auto", "qwen", ["qodercli", "-m", "Auto", "-p", "{prompt}"],
+                                   web=True, shell=True, cost="free")
+    o = setup(root)
+    refuses(RoutedFamilyError, lambda: o.dispatch("m", "x", "qoder-auto", verifies="w"), "qoder -m Auto")
+
+def routed_label_variants(root):
+    for lab in ("routed-unknown ", "ROUTED-UNKNOWN", "routed unknown"):
+        h = dataclasses.replace(ROSTER["qoder-ultimate"], family=lab)
+        assert resolve(h).family == ROUTED, f"{lab!r} not treated as routed"
+
+def argv_pin_cannot_be_edited(root):
+    try:
+        ROSTER["qoder"].argv[2] = "Ultimate"
+        raise AssertionError("argv is mutable -- a pin can be retargeted under its label")
+    except TypeError:
+        pass
+
+def unpinned_lane_refused(root):
+    o = setup(root)
+    refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "kimi", verifies="w"), "unpinned kimi")
+
+def label_contradicting_pin_refused(root):
+    o = setup(root); ROSTER["liar"] = stub("liar", "stubb", "stuba-9")   # says stubb, runs stuba
+    refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "liar", verifies="w"), "label vs pin")
+
+def unrecognised_model_refused(root):
+    for mid in ("inkling", "nemotron-3-ultra", "some/new-model"):
+        assert quorum.model_family(mid) == UNKNOWN, f"{mid!r} defaulted to {quorum.model_family(mid)!r}"
+    o = setup(root); ROSTER["new"] = stub("new", "inkling", "inkling")
+    refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "new", verifies="w"), "id not in table")
+
+# --- the record is not trusted over the roster -------------------------------------------
+def edited_job_record_refused(root):
+    o = setup(root); o.jobs["w"]["family"] = "stubc"                       # record says stubc
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="w"), "edited family field")
+
+def handwritten_routed_record_refused(root):
+    o = setup(root)
+    o.jobs["u"] = {"label": "u", "harness": "qoder-ultimate", "family": "qwen", "role": "worker"}
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="u"), "routed job relabelled qwen")
+
+def producer_repointed_between_dispatches(root):
+    o = setup(root); ROSTER["a"] = stub("a", "stuba", "stuba-2")        # same label, new pin
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="w"), "lane re-pointed")
+
+def unknown_target_refused(root):
+    try:
+        setup(root).dispatch("m", "x", "b", verifies="nope")
+        raise AssertionError("verifying an unknown job was allowed")
+    except KeyError:
+        pass
+
+# --- the CLI gate is the same gate -------------------------------------------------------
+def check_cli_matches_dispatch(root):
+    def cli(*a):
+        return subprocess.run([sys.executable, str(QDIR / "quorum.py"), "--check", *a],
+                              capture_output=True, text=True).returncode
+    cases = {("qoder-ultimate", "k3"): 1, ("qoder-ultimate", "qwen"): 1, ("devin", "routed-unknown"): 1,
+             ("kimi", "swe"): 1, ("devin", "K3 "): 0, ("devin", "SWE"): 1, ("qoder", "agy"): 0,
+             ("qoder", "qoder-ultimate"): 1, ("devin", "gemini"): 0}
+    bad = {k: (cli(*k), v) for k, v in cases.items() if cli(*k) != v}
+    assert not bad, f"--check disagrees with the rule: {bad}"
+    assert subprocess.run([sys.executable, str(QDIR / "quorum.py"), "--check", "devin", "qwen",
+                           "--overseer", "swe"], capture_output=True).returncode == 1, "--overseer ignored"
+
+def suggestions_are_usable(root):
+    try:
+        vet(ROSTER["qoder"], "qwen")
+        raise AssertionError("qwen verifying qwen allowed")
+    except SameFamilyError as e:
+        for bad in ("qoder-ultimate", "kimi", "'qoder'"):
+            assert bad not in str(e), f"suggests {bad}, which would be refused: {e}"
+
+# --- artifacts, labels, process control --------------------------------------------------
+def write_once_holds(root):
+    o = Op("t2", root=root)
+    a = o._path("x-output.md"); a.write_text("first")
+    assert o._path("x-output.md") != a, "second artifact would overwrite the first"
+    b = o._path("prompts/p.md"); b.write_text("first")
+    assert o._path("prompts/p.md").parent == b.parent != o.dir, "versioned prompt left prompts/"
+
+def duplicate_label_refused_retry_versions(root):
+    o = setup(root)
+    try:
+        o.dispatch("w", "y", "a", min_bytes=1)
+        raise AssertionError("label reuse silently replaced the job")
+    except ValueError:
+        pass
+    j = o.dispatch("w", "second prompt", "a", min_bytes=1, retry=True)
+    assert len(o.attempts["w"]) == 1, "superseded job not kept"
+    prompts = sorted(p.name for p in (o.dir / "prompts").iterdir())
+    assert prompts == ["prompt-w.md", "prompt-w.v2.md"], f"prompt overwritten: {prompts}"
+    assert o.attempts["w"][0]["output"] != j["output"], "output path reused"
+
+def timeout_kills_process_group(root):
+    pidf = pathlib.Path(root) / "child.pid"
+    ROSTER["slow"] = stub("slow", "stuba", "stuba-1", f"sleep 120 & echo $! > {pidf}; wait #{{prompt}}")
+    o = Op("t3", root=root); t0 = time.time()
+    j = o.dispatch("s", "x", "slow", timeout=2, min_bytes=1)
+    assert time.time() - t0 < 30, "timeout did not return promptly"
+    assert j["timed_out"], "timeout not recorded"
+    pid = int(pidf.read_text())
+    for _ in range(20):
+        try:
+            os.kill(pid, 0); time.sleep(0.1)
+        except ProcessLookupError:
+            return
+    raise AssertionError(f"grandchild {pid} survived the timeout")
+
+def stdin_is_closed(root):
+    ROSTER["cat"] = stub("cat", "stuba", "stuba-1", "cat; echo read-done #{prompt}")
+    j = Op("t4", root=root).dispatch("c", "x", "cat", timeout=10, min_bytes=1)
+    assert not j["timed_out"] and "read-done" in pathlib.Path(j["output"]).read_text(), \
+        "a dispatch reading stdin hung"
+
+# --- probes recognise, they do not trust exit 0 ------------------------------------------
+def probe_needs_positive_recognition(root):
+    fake = pathlib.Path(root) / "fakecli"
+    fake.write_text("#!/bin/sh\necho 'Not logged in · Please run /login'\nexit 0\n"); fake.chmod(0o755)
+    ROSTER["f"] = Harness("f", "stuba", [str(fake), "--model", "stuba-1"], True, True, "free")
+    MODEL_FAMILIES[:0] = [("stuba-", "stuba")]
+    PROBE_RECIPES[str(fake)] = [("model-offered", [str(fake)], "{model}")]
+    o = Op("t5", root=root)
+    assert o.probe(["f"]) == {"f": False}, "exit 0 + 'Not logged in' passed the probe"
+    assert o.probes["f"][-1]["checks"][0]["class"] == "not-logged-in", o.probes["f"]
+    fake.write_text("#!/bin/sh\necho MODEL\necho stuba-1\n")
+    assert o.probe(["f"]) == {"f": True}, "a live catalog offering the pin failed"
+    fake.write_text("#!/bin/sh\necho MODEL\necho stuba-2\n")
+    assert o.probe(["f"]) == {"f": False}, "a stale pin passed"
+
+def probe_without_recipe_is_declared_only(root):
+    ROSTER["s"] = stub("s", "stuba", "stuba-1")
+    o = Op("t6", root=root)
+    assert o.probe(["s"]) == {"s": False}, "no-recipe lane passed as if exercised"
+    assert o.probe(["s"], allow_declared=True) == {"s": True}, "allow_declared ignored"
+
+print("quorum guard tests (v3)")
+for n, f in [
+    ("stub harness is runnable",                    stub_is_runnable),
+    ("cross-family dispatch ACTUALLY RUNS",         cross_family_actually_dispatches),
+    ("same family refused [SameFamily]",            same_family_refused),
+    ("family compare ignores case/space",           same_family_ignores_case_and_space),
+    ("overseer family refused [Overseer]",          overseer_family_refused),
+    ("explicit Op overseer is the one enforced",    explicit_overseer_is_used),
+    ("routed alias refused as verifier [Routed]",   routed_alias_refused_as_verifier),
+    ("routed alias refused as PRODUCER [Routed]",   routed_alias_refused_as_producer),
+    ("relabelled routed lane still routed",         relabelled_routed_lane_still_routed),
+    ("new lane on a routed alias refused",          new_lane_on_routed_alias_refused),
+    ("routed label variants normalised",            routed_label_variants),
+    ("argv pin cannot be edited in place",          argv_pin_cannot_be_edited),
+    ("unpinned lane refused [Unknown]",             unpinned_lane_refused),
+    ("label contradicting pin refused [Unknown]",   label_contradicting_pin_refused),
+    ("unrecognised model id refused [Unknown]",     unrecognised_model_refused),
+    ("edited job record refused [Mismatch]",        edited_job_record_refused),
+    ("hand-written routed record refused",          handwritten_routed_record_refused),
+    ("producer re-pointed between dispatches",      producer_repointed_between_dispatches),
+    ("unknown verify target refused",               unknown_target_refused),
+    ("--check is the dispatch rule",                check_cli_matches_dispatch),
+    ("refusal suggestions are usable",              suggestions_are_usable),
+    ("write-once path never reused",                write_once_holds),
+    ("duplicate label refused; retry versions",     duplicate_label_refused_retry_versions),
+    ("timeout kills the process group",             timeout_kills_process_group),
+    ("stdin closed: no dispatch hangs on input",    stdin_is_closed),
+    ("probe: exit 0 is not a pass",                 probe_needs_positive_recognition),
+    ("probe: no recipe = declared only",            probe_without_recipe_is_declared_only),
+]:
+    run(n, f)
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")
 sys.exit(1 if FAILS else 0)

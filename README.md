@@ -13,15 +13,18 @@ the wrong one.
 from quorum import Op, IndependenceError
 
 op = Op("op-004")
-op.probe(["kimi", "devin"], need_web=True)          # capability, not documentation
+op.probe(["qoder", "devin"])                        # exercised, not documented
 
-w = op.dispatch("research", RESEARCH_PROMPT, "kimi")            # k3 family
-op.dispatch("verify", CHECK_PROMPT, "kimi", verifies="research")
-# IndependenceError: kimi (family=k3) may not verify research (family=k3).
+w = op.dispatch("research", RESEARCH_PROMPT, "qoder")           # pinned Qwen3.8-Max → qwen
+op.dispatch("verify", CHECK_PROMPT, "qoder", verifies="research")
+# SameFamilyError: qoder (family=qwen) may not verify family=qwen.
 # A family cannot check its own output — same training, same blind spots.
-# Choose from: ['agy', 'devin', 'qoder', 'qoder-ultimate']
+# Choose from: ['agy', 'devin']
 
-op.dispatch("verify", CHECK_PROMPT, "devin", verifies="research")   # swe checks k3 — allowed
+op.dispatch("verify", CHECK_PROMPT, "qoder-ultimate", verifies="research")
+# RoutedFamilyError: ... served by a routed alias, so its family is unknowable
+
+op.dispatch("verify", CHECK_PROMPT, "devin", verifies="research")   # swe checks qwen — allowed
 print(op.summary())
 ```
 
@@ -42,6 +45,55 @@ Each of these exists because the rule was broken by hand first, in real operatio
 
 It also refuses any harness sharing the *orchestrator's* own family. The party running the
 operation cannot supply its own independent verification.
+
+## Where the family comes from (v0.2)
+
+v0.1 trusted each lane's `family` label. A cross-family read (grok-4.7, via the Decatron desk)
+showed what that cost: point a lane at a routed alias like `Ultimate`, or relabel the routed
+lane, and the guard passed, because it compared strings nobody had checked. One agent CLI on
+our box serves Claude, GPT, Gemini, Grok, Kimi, GLM and DeepSeek behind a single binary, so
+neither the binary nor the label says which model answers.
+
+The family is now **resolved from the model pinned in argv** (`-m`/`--model`) via a prefix table
+(`MODEL_FAMILIES`), and the label must agree with it. A lane is refused **on either side** of a
+verification when it is:
+
+| Resolves to | When | Refusal |
+|---|---|---|
+| `routed-unknown` | pinned to a router (`Auto`, `Ultimate`, `Adaptive`, …), or declared routed | `RoutedFamilyError` |
+| `unknown` | no pin; a pin the table does not know; a label contradicting its pin | `UnknownFamilyError` |
+| same family | both sides resolve equal (case and whitespace ignored) | `SameFamilyError` |
+| orchestrator's | verifier shares the overseer family | `OverseerFamilyError` |
+
+All five are `IndependenceError`s. When verifying, the producing job's harness is **re-resolved
+from the roster**, not read back from the job record; if the record and the roster disagree
+(edited record, or a lane re-pointed between dispatches), that is `RecordMismatchError`.
+`quorum.py --check HARNESS TARGET` calls the same rule as `dispatch` (v0.1's CLI kept an older
+copy and allowed pairs dispatch refused). `TARGET` is a harness name or a family; `--overseer`
+sets the orchestrator family.
+
+**Fail closed is deliberate.** An unknown model id is never defaulted to a family. The shipped
+`kimi` lane has no pin, so it now works as a producer but cannot sit on either side of a
+verification. Extend `MODEL_FAMILIES` for your own models.
+
+## Probes record what they saw (v0.2)
+
+`probe()` used to check that the binary existed and then re-read the roster's `web` field. That
+reads the claim instead of exercising the capability. One CLI printed `Not logged in` to stdout
+**with exit 0** while the old probe called it live.
+
+A probe now runs a per-CLI recipe (`PROBE_RECIPES`) and **passes only on positive recognition**:
+`devin auth status` must say `Logged in`, and each CLI's account-scoped model list must contain
+the lane's exact pin (a retired pin fails here). Exit status alone never passes; unrecognised
+output fails. A lane with no recipe is *declared-only* and fails unless `allow_declared=True`.
+Each probe is logged as a dated observation: argv hash, binary fingerprint, a classification
+per check, and an output hash. Web access is still **declared, not exercised**, and the log says
+so.
+
+Dispatches and probes run with stdin closed, in their own process group, and a timeout kills
+the whole group. Agent CLIs spawn workers that survive a direct-child kill. A label is used once:
+reuse is refused unless `retry=True`, which keeps the superseded job in `op.attempts`. Prompts
+are versioned write-once, like outputs.
 
 ## The roster is the point
 
@@ -65,7 +117,11 @@ how you get confident nonsense at scale.
 ## Honest limitations
 
 - **Sequential.** No parallel dispatch yet. Wall-clock is the sum, not the max.
-- **`family` is declared, not detected.** Mislabel a harness and the guarantee is void.
+- **Family is resolved from the pin, not detected from the weights.** quorum trusts that the
+  CLI serves the model it was asked for. A vendor that quietly routes a pinned id elsewhere
+  defeats it, and no probe here can see through a router that does not report what it served.
+- **Web access is not yet exercised.** An honest web probe needs a nonce on an endpoint you
+  control; until then it is a recorded declaration.
 - **The blocked threshold is a heuristic.** Its own smoke test flagged a correct 14-byte answer
   as blocked; `min_bytes` is now per-dispatch, but you have to set it sensibly.
 - **Independence is structural, not semantic.** Different families can still be wrong the same

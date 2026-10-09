@@ -25,6 +25,12 @@ What is mechanised, and the failure that motivated each:
                          hand instead of taken from the clock
   cost tiering           an 85%-failure lane must not spend a paid tier on the
                          85%
+  family from the pin    a routed alias labelled "qwen" could have been Kimi
+                         checking Kimi; the family is now read from the model
+                         pinned in argv, and anything unpinned, routed, or
+                         contradicting its label is refused as unverifiable
+  process-group kill     a timeout killed the CLI and left its workers running;
+                         stdin is closed so a prompt cannot hang a dispatch
 
 Read-only with respect to judgement: quorum dispatches, records, and refuses.
 It does not decide what to ask, and it does not adjudicate what comes back.
@@ -35,14 +41,17 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
 import pathlib
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 # --------------------------------------------------------------------- roster
@@ -51,16 +60,23 @@ __version__ = "0.1.0"
 class Harness:
     """A dispatchable agent CLI.
 
-    `family` is the independence key. Two harnesses sharing a family may never
-    check each other, regardless of vendor or model name.
+    `family` is the DECLARED independence key. It is not trusted on its own:
+    `resolve()` reads the model pinned in argv and refuses a lane whose pin is
+    missing, routed, unknown, or contradicts the declaration. Two harnesses
+    resolving to the same family may never check each other.
     """
     name: str
     family: str
-    argv: list[str]          # {prompt} is substituted
+    argv: tuple[str, ...]    # {prompt} is substituted; frozen so a pin cannot be edited in place
     web: bool                # verified by probe, not by documentation
     shell: bool              # can execute local commands
     cost: str                # "free" | "cheap" | "paid"
     notes: str = ""
+
+    def __post_init__(self) -> None:
+        # A list here let `ROSTER["qoder"].argv[2] = "Ultimate"` retarget a lane while
+        # its family label stayed put (grok-4.7 cross-family read, 2026-10-08).
+        object.__setattr__(self, "argv", tuple(self.argv))
 
     def command(self, prompt: str) -> list[str]:
         return [a.replace("{prompt}", prompt) for a in self.argv]
@@ -68,13 +84,101 @@ class Harness:
 
 # A routed alias (qodercli "Ultimate", "Auto", ...) picks a model per request from a
 # catalog spanning several families -- Qwen, Kimi, GLM, DeepSeek, MiniMax on the
-# 2026-10-07 listing. Its family is not knowable at dispatch, so a lane served
-# through one carries ROUTED rather than a guessed family. Labelling it "qwen", as
-# this roster did, let the independence check trust a claim nobody could verify:
+# 2026-10-07 listing. Its family is not knowable at dispatch. Labelling it "qwen", as
+# this roster once did, let the independence check trust a claim nobody could verify:
 # an Ultimate verifier could be Kimi-K3 checking k3 work, with no error raised.
-# Reported by the Decatron desk (review-3 roster note); this is the stopgap until
-# per-model family slots (U-5) exist.
-ROUTED = "routed-unknown"
+# Reported by the Decatron desk (review-3 roster note).
+#
+# v0.1 fixed that by relabelling one lane, and the guard still read only the label:
+# point any lane at "Ultimate", or relabel the routed lane, and it passed (grok-4.7
+# cross-family read, 2026-10-08). So the family is now RESOLVED from the model pinned
+# in argv, and the declared label must agree with it. Devin's catalog alone serves
+# Claude, GPT, Gemini, Grok, Kimi, GLM and DeepSeek behind one binary, so a binary
+# name says nothing about family; only the pin does.
+ROUTED = "routed-unknown"      # served by a router; family decided per request
+UNKNOWN = "unknown"            # unpinned, unrecognised, or contradicting its label
+
+MODEL_FLAGS = ("-m", "--model")
+
+# Router names observed in live catalogs (qodercli --list-models and devin models
+# list, 2026-10-08). Matched after normalisation, so case does not matter.
+ROUTED_ALIASES = {"auto", "ultimate", "performance", "efficient", "lite", "sonus",
+                  "cantus", "adaptive", "fusion", "default"}
+
+# Model id -> family, by prefix of the normalised id (vendor prefix "x/" stripped).
+# First match wins. This table is data: an id it does not recognise resolves to
+# UNKNOWN and is refused, never defaulted. Extend it for your own lanes.
+MODEL_FAMILIES: list[tuple[str, str]] = [
+    ("qwen", "qwen"),
+    ("kimi", "k3"), ("k3", "k3"),            # Moonshot; K2.x and K3 are one family here
+    ("glm", "glm"),
+    ("deepseek", "deepseek"),
+    ("minimax", "minimax"),
+    ("gemini", "gemini"),
+    ("swe-", "swe"),
+    ("claude", "anthropic"), ("opus", "anthropic"), ("sonnet", "anthropic"),
+    ("haiku", "anthropic"), ("fable", "anthropic"),
+    ("gpt", "openai"), ("codex", "openai"),
+    ("grok", "grok"),
+]
+
+
+def norm(family: str) -> str:
+    """Compare families as identifiers: "K3 " and "k3" are one family, as are
+    "routed unknown" and "routed-unknown"."""
+    return re.sub(r"[\s_]+", "-", str(family).strip().casefold())
+
+
+def pinned_models(argv) -> list[str]:
+    """Every model named by -m/--model (or --model=) in argv."""
+    out, it = [], iter(argv)
+    for a in it:
+        if a in MODEL_FLAGS:
+            out.append(next(it, ""))
+        elif a.startswith("--model="):
+            out.append(a.split("=", 1)[1])
+    return out
+
+
+def model_family(model: str) -> str:
+    m = norm(model).rsplit("/", 1)[-1]
+    if m in ROUTED_ALIASES:
+        return ROUTED
+    for prefix, fam in MODEL_FAMILIES:
+        if m.startswith(norm(prefix)):
+            return fam
+    return UNKNOWN
+
+
+@dataclasses.dataclass(frozen=True)
+class Resolution:
+    family: str              # a concrete family, ROUTED, or UNKNOWN
+    model: str | None
+    why: str
+
+
+def resolve(h: "Harness") -> Resolution:
+    """The family a harness can be SHOWN to run, from its argv -- not its label."""
+    declared = norm(h.family)
+    pins = pinned_models(h.argv)
+    model = pins[-1] if pins else None
+    if declared == ROUTED:
+        return Resolution(ROUTED, model, "declared routed")
+    if len({norm(x) for x in pins}) > 1:
+        return Resolution(UNKNOWN, model, f"argv pins several models {pins}")
+    if model is None:
+        return Resolution(UNKNOWN, None,
+                          f"no model pinned in argv; {h.argv[0]} runs whatever its config "
+                          f"defaults to, so the declared family {h.family!r} is a claim only")
+    fam = model_family(model)
+    if fam == ROUTED:
+        return Resolution(ROUTED, model, f"pin {model!r} is a routed alias")
+    if fam == UNKNOWN:
+        return Resolution(UNKNOWN, model, f"pin {model!r} is not in MODEL_FAMILIES")
+    if fam != declared:
+        return Resolution(UNKNOWN, model,
+                          f"declared {h.family!r} but pin {model!r} is family {fam!r}")
+    return Resolution(fam, model, "pinned")
 
 
 # Empirical roster. Every field below was established by probe or by failure
@@ -96,9 +200,10 @@ ROSTER: dict[str, Harness] = {
         "kimi", "k3",
         ["kimi", "-p", "{prompt}"],
         web=True, shell=True, cost="free",
-        notes="Appends reasoning bullets and a session-resume line to stdout; "
-              "parsers must tolerate. Has aborted before composing a final answer "
-              "— give it an explicit compose deadline."),
+        notes="UNPINNED: runs config.toml's default_model, so its family cannot be "
+              "established and it is refused on either side of a verification. "
+              "Appends reasoning bullets and a session-resume line to stdout. Has "
+              "aborted before composing a final answer — give it a compose deadline."),
     "qoder": Harness(
         "qoder", "qwen",
         ["qodercli", "-m", "Qwen3.8-Max", "-p", "{prompt}",
@@ -111,11 +216,14 @@ ROSTER: dict[str, Harness] = {
         ["qodercli", "-m", "Ultimate", "-p", "{prompt}",
          "--print", "--max-output-tokens", "8000", "--no-session-persistence"],
         web=True, shell=True, cost="free",
-        notes="Top-tier routed. Promotional balance only — falls back to PAID "
-              "billing once exhausted. Confirm balance before volume use."),
+        notes="ROUTED: serves several families per request, so it is refused on "
+              "either side of a verification. Worker use only. Promotional balance "
+              "— falls back to PAID billing once exhausted."),
 }
 
-# The Overseer's own family. Anything Delta authors is checked by something else.
+# The default Overseer family. Anything Delta authors is checked by something else.
+# This is only a DEFAULT: an Op constructed with an explicit `overseer=` uses that
+# instead, and `--check --overseer` does the same. It does not constrain such runs.
 OVERSEER_FAMILY = "anthropic"
 
 
@@ -123,6 +231,94 @@ OVERSEER_FAMILY = "anthropic"
 
 class IndependenceError(RuntimeError):
     """Raised when a dispatch would let a family check its own work."""
+
+class RoutedFamilyError(IndependenceError):
+    """One side is served by a router; its family is decided per request."""
+
+class UnknownFamilyError(IndependenceError):
+    """One side's family cannot be established from its pinned model."""
+
+class SameFamilyError(IndependenceError):
+    """Both sides resolve to one family."""
+
+class OverseerFamilyError(IndependenceError):
+    """The verifier shares the orchestrator's family."""
+
+class RecordMismatchError(IndependenceError):
+    """The job record and the roster disagree about what produced the work."""
+
+
+def _alternatives(target_family: str, overseer: str) -> list[str]:
+    return sorted(x.name for x in ROSTER.values()
+                  if (f := resolve(x).family) not in (ROUTED, UNKNOWN, target_family, norm(overseer)))
+
+
+def vet(verifier: Harness, target: Resolution | str, overseer: str = OVERSEER_FAMILY) -> None:
+    """THE independence rule. Raises if `verifier` may not check work whose family is
+    `target`. dispatch() and the --check CLI both call this; there is no second copy
+    to drift (v0.1's --check allowed pairs dispatch refused)."""
+    v = resolve(verifier)
+    t = target if isinstance(target, Resolution) else Resolution(norm(target), None, "given")
+    if ROUTED in (v.family, t.family):
+        side = "verifier" if v.family == ROUTED else "target"
+        raise RoutedFamilyError(
+            f"{verifier.name} (family={v.family}) verifying family={t.family}: the {side} is "
+            f"served by a routed alias, so its family is unknowable at dispatch and independence "
+            f"cannot be established. Use a lane pinned to one model.")
+    if UNKNOWN in (v.family, t.family):
+        why = v.why if v.family == UNKNOWN else t.why
+        raise UnknownFamilyError(
+            f"{verifier.name} (family={v.family}) verifying family={t.family}: independence cannot "
+            f"be established — {why}. Pin a model the family table recognises.")
+    if v.family == t.family:
+        raise SameFamilyError(
+            f"{verifier.name} (family={v.family}) may not verify family={t.family}. A family "
+            f"cannot check its own output — same training, same blind spots. "
+            f"Choose from: {_alternatives(t.family, overseer)}")
+    if v.family == norm(overseer):
+        raise OverseerFamilyError(
+            f"{verifier.name} shares the Overseer's family ({norm(overseer)}); it cannot "
+            f"provide independent verification of this operation's work.")
+
+
+# Exact-capability probes, keyed by binary. A probe passes only on POSITIVE
+# recognition of expected content -- never on exit status alone: qodercli prints
+# "Not logged in" to STDOUT, sometimes with exit 0 (Decatron R5c, 2026-08-09).
+# Unrecognised output is a FAIL. "{model}" means: some line's first token is exactly
+# the lane's pinned model, i.e. the account's live catalog still offers the pin (the
+# stale Qwen3.8-Max-Preview pin would have failed here). Recipes were checked against
+# the installed CLIs on 2026-10-08.
+PROBE_RECIPES: dict[str, list[tuple[str, list[str], str]]] = {
+    "devin":    [("auth", ["devin", "auth", "status"], r"(?m)^Logged in\b"),
+                 ("model-offered", ["devin", "models", "list"], "{model}")],
+    "qodercli": [("model-offered", ["qodercli", "--list-models"], "{model}")],
+    "agy":      [("model-offered", ["agy", "models"], "{model}")],
+}
+NOT_LOGGED_IN = re.compile(r"not logged in|please (run )?/?login|unauthori[sz]ed|sign in", re.I)
+
+
+def run_isolated(argv: list[str], timeout: float) -> tuple[int, str, str, bool]:
+    """Run non-interactively in its own process group: stdin closed, no TTY, and on
+    timeout the WHOLE group is killed. subprocess.run(timeout=) kills only the direct
+    child, and agent CLIs spawn workers (U-2)."""
+    try:
+        p = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, start_new_session=True)
+    except OSError as e:
+        return -1, "", f"{type(e).__name__}: {e}", False
+    try:
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out or "", err or "", False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            out, err = p.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+        return -9, out or "", (err or "") + f"\n[quorum] timeout after {timeout}s; process group killed", True
 
 
 # ---------------------------------------------------------------- the operation
@@ -138,6 +334,8 @@ class Op:
         self.overseer = overseer
         self.ledger = self.dir / "LEDGER.md"
         self.jobs: dict[str, dict] = {}
+        self.attempts: dict[str, list[dict]] = {}     # superseded jobs, on retry
+        self.probes: dict[str, list[dict]] = {}
         if not self.ledger.exists():
             self.ledger.write_text(
                 f"# {opid} Execution Ledger\n\n"
@@ -168,7 +366,7 @@ class Op:
         if not p.exists():
             return p
         n = 2
-        while (alt := self.dir / f"{p.stem}.v{n}{p.suffix}").exists():
+        while (alt := p.with_name(f"{p.stem}.v{n}{p.suffix}")).exists():
             n += 1
         return alt
 
@@ -177,32 +375,72 @@ class Op:
         return hashlib.sha256(p.read_bytes()).hexdigest()[:16] if p.exists() else "—"
 
     # -- probes ------------------------------------------------------------
-    def probe(self, names: list[str], need_web: bool = False) -> dict[str, bool]:
-        """Verify each harness can do what it is about to be asked to do.
+    def probe(self, names: list[str], need_web: bool = False,
+              allow_declared: bool = False, timeout: float = 60) -> dict[str, bool]:
+        """Exercise what each harness is about to be asked to do.
 
         A capability listed in documentation is a claim. An operation was once
-        planned around a harness's web access that it did not have.
+        planned around a harness's web access that it did not have, and a liveness
+        check once green-lit a CLI that printed "Not logged in" with exit 0.
+
+        Each result is a dated observation under a recorded invocation (argv hash,
+        binary fingerprint), passing only on positive recognition of expected
+        content. A harness with no exercise recipe is DECLARED-ONLY and fails
+        unless `allow_declared=True`. `need_web` is still checked against the
+        roster's declaration, and is logged as declared, not exercised.
         """
         results = {}
         for name in names:
             h = ROSTER[name]
-            if shutil.which(h.argv[0]) is None:
-                results[name] = False
-                self.log("quorum", "—", "PROBE", f"{name}: FAIL — binary not found")
-                continue
-            if need_web and not h.web:
-                results[name] = False
-                self.log("quorum", "—", "PROBE",
-                         f"{name}: FAIL — web required, roster records no web access. {h.notes}")
-                continue
-            results[name] = True
-            self.log("quorum", "—", "PROBE", f"{name}: PASS (family={h.family}, cost={h.cost})")
+            rec = {"at": self._now(), "harness": name, "argv_sha": hashlib.sha256(
+                json.dumps(list(h.argv)).encode()).hexdigest()[:16], "checks": []}
+            self.probes.setdefault(name, []).append(rec)
+            ok, why = self._probe_one(h, rec, need_web, allow_declared, timeout)
+            results[name] = ok
+            self.log("quorum", "—", "PROBE",
+                     f"{name}: {'PASS' if ok else 'FAIL'} — {why} "
+                     f"(family={resolve(h).family}, cost={h.cost}, argv {rec['argv_sha']}, "
+                     f"bin {rec.get('bin', '—')})")
         return results
+
+    def _probe_one(self, h: Harness, rec: dict, need_web: bool,
+                   allow_declared: bool, timeout: float) -> tuple[bool, str]:
+        path = shutil.which(h.argv[0])
+        if path is None:
+            return False, "binary not found"
+        st = os.stat(path)
+        rec["bin"] = hashlib.sha256(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode()).hexdigest()[:12]
+        if need_web and not h.web:
+            return False, f"web required, roster records no web access. {h.notes}"
+        recipes = PROBE_RECIPES.get(h.argv[0]) or PROBE_RECIPES.get(os.path.basename(h.argv[0]))
+        if not recipes:
+            return allow_declared, ("no exercise recipe for this binary — DECLARED-ONLY"
+                                    + ("" if allow_declared else "; refused (allow_declared=False)"))
+        model = resolve(h).model
+        for kind, argv, expect in recipes:
+            code, out, err, timed_out = run_isolated(argv, timeout)
+            text = out + "\n" + err
+            if timed_out:
+                cls = "timeout"
+            elif expect == "{model}":
+                cls = ("ok" if model and any(ln.split()[:1] == [model] for ln in out.splitlines())
+                       else "not-logged-in" if NOT_LOGGED_IN.search(text) else "model-not-offered"
+                       if out.strip() else "unrecognised")
+            else:
+                cls = ("ok" if re.search(expect, out) else "not-logged-in"
+                       if NOT_LOGGED_IN.search(text) else "unrecognised")
+            rec["checks"].append({"kind": kind, "exit": code, "class": cls,
+                                  "out_sha": hashlib.sha256(text.encode()).hexdigest()[:16]})
+            if cls != "ok":
+                return False, f"{kind}: {cls} (exit {code})" + (
+                    f" — pin {model!r} not in the live catalog" if cls == "model-not-offered" else "")
+        web = "; web DECLARED (not exercised)" if need_web else ""
+        return True, "exercised: " + ", ".join(c["kind"] for c in rec["checks"]) + web
 
     # -- dispatch ----------------------------------------------------------
     def dispatch(self, label: str, prompt: str, harness: str,
                  verifies: str | None = None, role: str = "worker",
-                 min_bytes: int = 200) -> dict:
+                 min_bytes: int = 200, timeout: float = 3600, retry: bool = False) -> dict:
         """Run one agent. Refuses same-family verification.
 
         `verifies` names a previous job. When set, this dispatch is a check on
@@ -212,48 +450,59 @@ class Op:
         `min_bytes` is the floor below which output counts as BLOCKED. Set it to
         the smallest plausible real answer for THIS dispatch — a one-word probe
         and a research report do not share a threshold.
+
+        A label is used once. `retry=True` supersedes the label's job (kept in
+        `self.attempts`); prompt and output files are versioned, never overwritten.
         """
         h = ROSTER[harness]
+        res = resolve(h)
 
         if verifies is not None:
             target = self.jobs.get(verifies)
             if target is None:
                 raise KeyError(f"cannot verify unknown job {verifies!r}")
-            if ROUTED in (h.family, target["family"]):
-                raise IndependenceError(
-                    f"{harness} (family={h.family}) verifying {verifies} "
-                    f"(family={target['family']}): a routed alias serves several families and "
-                    f"its family is unknowable at dispatch, so independence cannot be "
-                    f"established. Use a lane pinned to one model.")
-            if h.family == target["family"]:
-                raise IndependenceError(
-                    f"{harness} (family={h.family}) may not verify {verifies} "
-                    f"(family={target['family']}). A family cannot check its own output — "
-                    f"same training, same blind spots. Choose from: "
-                    f"{sorted({x.name for x in ROSTER.values() if x.family != target['family']})}")
-            if h.family == self.overseer:
-                raise IndependenceError(
-                    f"{harness} shares the Overseer's family ({self.overseer}); it cannot "
-                    f"provide independent verification of this operation's work.")
+            # Re-resolve the producer from the roster rather than trusting the job's
+            # stored `family` field, and refuse if the two disagree: a record edited
+            # after the fact, or a lane re-pointed between dispatches, is not the
+            # thing that produced the work (grok-4.7, 2026-10-08).
+            th = ROSTER.get(target.get("harness", ""))
+            if th is None:
+                raise RecordMismatchError(
+                    f"job {verifies!r} names harness {target.get('harness')!r}, which is not in "
+                    f"the roster; what produced it cannot be established.")
+            tres = resolve(th)
+            if norm(target.get("family", "")) != tres.family or (
+                    "argv" in target and tuple(target["argv"]) != th.argv):
+                raise RecordMismatchError(
+                    f"job {verifies!r} records family={target.get('family')!r} but its harness "
+                    f"{th.name} now resolves to {tres.family!r} ({tres.why}); the record and the "
+                    f"roster disagree, so independence cannot be established.")
+            vet(h, tres, self.overseer)
 
-        pp = self.dir / "prompts" / f"prompt-{label}.md"
+        if label in self.jobs:
+            if not retry:
+                raise ValueError(
+                    f"label {label!r} already has a job; pass retry=True to supersede it "
+                    f"(the earlier job is kept in op.attempts) or use a new label (U-3)")
+            self.attempts.setdefault(label, []).append(self.jobs[label])
+
+        pp = self._path(f"prompts/prompt-{label}.md")   # write-once, like outputs (U-3)
         pp.write_text(prompt)
         out = self._path(f"{label}-output.md")
 
         self.log(harness, pp.name, "DISPATCH",
                  f"{role} '{label}'"
-                 + (f" verifying '{verifies}' (cross-family {target['family']}→{h.family})" if verifies else "")
+                 + (f" (retry #{len(self.attempts[label])})" if retry and label in self.attempts else "")
+                 + (f" verifying '{verifies}' (cross-family {tres.family}→{res.family})" if verifies else "")
+                 + ("" if res.family not in (ROUTED, UNKNOWN) or verifies
+                    else f" — family {res.family}: {res.why}; this output cannot be verified "
+                         f"by an independence-checked dispatch")
                  + f". Output → {out.name}.", self._sha(pp))
 
         t0 = time.time()
-        try:
-            r = subprocess.run(h.command(prompt), capture_output=True, text=True, timeout=3600)
-            out.write_text(r.stdout or "")
-            code = r.returncode
-            err = (r.stderr or "")[-400:]
-        except Exception as e:  # noqa: BLE001
-            out.write_text("")
-            code, err = -1, f"{type(e).__name__}: {e}"
+        code, stdout, err, timed_out = run_isolated(h.command(prompt), timeout)
+        out.write_text(stdout)
+        err = err[-400:]
 
         size = out.stat().st_size
         # Expected output length varies by three orders of magnitude between a
@@ -262,7 +511,8 @@ class Op:
         # this module's own smoke test — a verification tool that cries wolf
         # gets ignored, which is the failure mode it exists to prevent.
         blocked = size < min_bytes
-        job = {"label": label, "harness": harness, "family": h.family, "role": role,
+        job = {"label": label, "harness": harness, "family": res.family, "model": res.model,
+               "argv": list(h.argv), "role": role, "timed_out": timed_out,
                "output": str(out), "bytes": size, "exit": code, "blocked": blocked,
                "secs": round(time.time() - t0), "verifies": verifies}
         self.jobs[label] = job
@@ -302,28 +552,41 @@ def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(prog="quorum", description="Roster and independence rules.")
     ap.add_argument("--roster", action="store_true", help="print the harness roster")
-    ap.add_argument("--check", nargs=2, metavar=("HARNESS", "TARGET_FAMILY"),
-                    help="would HARNESS be allowed to verify TARGET_FAMILY's output?")
+    ap.add_argument("--check", nargs=2, metavar=("HARNESS", "TARGET"),
+                    help="would HARNESS be allowed to verify output from TARGET "
+                         "(a roster harness name, or a family)? Same rule as dispatch.")
+    ap.add_argument("--overseer", default=OVERSEER_FAMILY,
+                    help=f"orchestrator family for --check (default {OVERSEER_FAMILY})")
     a = ap.parse_args()
 
     if a.check:
-        name, fam = a.check
+        name, tgt = a.check
         h = ROSTER.get(name)
         if not h:
             print(f"unknown harness {name!r}"); return 2
-        ok = h.family != fam and h.family != OVERSEER_FAMILY
-        print(f"{name} (family={h.family}) verifying {fam}: {'ALLOWED' if ok else 'REFUSED'}")
-        if not ok:
-            print("  a family cannot check its own output — same training, same blind spots")
-        return 0 if ok else 1
+        target = resolve(ROSTER[tgt]) if tgt in ROSTER else tgt
+        tfam = target.family if isinstance(target, Resolution) else norm(tgt)
+        try:
+            vet(h, target, a.overseer)
+        except IndependenceError as e:
+            print(f"{name} (family={resolve(h).family}) verifying {tfam}: REFUSED "
+                  f"[{type(e).__name__}]\n  {e}")
+            return 1
+        print(f"{name} (family={resolve(h).family}) verifying {tfam}: ALLOWED")
+        return 0
 
+    rows = [(h.name, h.family, (r := resolve(h)).family, r.model or "—",
+             "yes" if h.web else "NO", "yes" if h.shell else "no", h.cost, h.notes)
+            for h in ROSTER.values()]
+    head = ("name", "declared", "resolved", "pin", "web", "shell", "cost")
+    w = [max(len(head[i]), *(len(r[i]) for r in rows)) + 2 for i in range(len(head))]
     print(f"quorum {__version__} — harness roster (empirical; probe-derived)\n")
-    print(f"{'name':<16}{'family':<10}{'web':<6}{'shell':<7}{'cost':<7}notes")
-    print("-" * 100)
-    for h in ROSTER.values():
-        print(f"{h.name:<16}{h.family:<10}{'yes' if h.web else 'NO':<6}"
-              f"{'yes' if h.shell else 'no':<7}{h.cost:<7}{h.notes[:56]}")
-    print(f"\noverseer family: {OVERSEER_FAMILY} — excluded from verifying this operation's work")
+    print("".join(f"{head[i]:<{w[i]}}" for i in range(len(head))) + "notes")
+    print("-" * (sum(w) + 40))
+    for r in rows:
+        print("".join(f"{r[i]:<{w[i]}}" for i in range(len(head))) + r[7][:60])
+    print(f"\noverseer family: {OVERSEER_FAMILY} (default) — excluded from verifying this operation's work")
+    print(f"resolved {ROUTED} / {UNKNOWN}: refused on either side of a verification")
     return 0
 
 

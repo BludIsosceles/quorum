@@ -113,8 +113,11 @@ ROUTED_ALIASES = {"auto", "ultimate", "performance", "efficient", "lite", "sonus
 # A table entry is a regex matched at the START of the normalised id after its
 # vendor path ("nvidia/", "kimi-code/") is removed; it names the id's leading model
 # line. First match wins. v0.2.0 used bare prefixes, and "gpt", "opus" and "swe-"
-# claimed ids they merely began with; entries now require a separator or digit
-# after the name. An id no entry matches is UNKNOWN and refused, never defaulted.
+# claimed ids they merely began with. Now a name is followed by a separator, and a
+# version number must end at a separator or the end of the id ("gpt-5foo" and
+# "qwen3foo" are unknown). An id no entry matches is UNKNOWN and refused, never
+# defaulted. Names carrying another lab's token are refused even when single-lab:
+# a deliberate false negative, the safe direction.
 #
 # The leading name is necessary, NOT sufficient: classify() also refuses an id
 # whose other name tokens (LINEAGE_TOKENS) or whose vendor path (VENDOR_FAMILIES)
@@ -124,23 +127,23 @@ ROUTED_ALIASES = {"auto", "ultimate", "performance", "efficient", "lite", "sonus
 # Entries are only for lineages the maintainer can vouch for; everything else stays
 # unknown. Coverage extended 2026-10-09 to the pins the Decatron engine fields.
 MODEL_FAMILIES: list[tuple[str, str]] = [
-    ("qwen\\d", "qwen"),
+    ("qwen\\d[\\d.]*(?=[-:_+]|$)", "qwen"),
     ("kimi-", "k3"), ("k3$", "k3"),                          # Moonshot; K2.x and K3 are one family
-    ("glm-\\d", "glm"),
+    ("glm-\\d[\\d.]*(?=[-:_+]|$)", "glm"),
     ("deepseek-", "deepseek"),
     ("minimax-", "minimax"),
-    ("gemini-\\d", "gemini"), ("gemma-\\d", "gemini"), ("diffusiongemma-", "gemini"),   # Google
-    ("swe(-\\d|$)", "swe"),                                    # Cognition; bare "swe" is an alias
+    ("gemini-\\d[\\d.]*(?=[-:_+]|$)", "gemini"), ("gemma-\\d[\\d.]*(?=[-:_+]|$)", "gemini"), ("diffusiongemma-", "gemini"),   # Google
+    ("swe(-\\d[\\d.]*(?=[-:_+]|$)|$)", "swe"),                                    # Cognition; bare "swe" is an alias
     ("claude-", "anthropic"), ("(opus|sonnet|haiku|fable)$", "anthropic"),
-    ("gpt-oss-", "openai"), ("gpt-\\d", "openai"), ("codex$", "openai"),
-    ("grok-\\d", "grok"),
+    ("gpt-oss-", "openai"), ("gpt-\\d[\\d.]*(?=[-:_+]|$)", "openai"), ("codex$", "openai"),
+    ("grok-\\d[\\d.]*(?=[-:_+]|$)", "grok"),
     ("llama-", "meta"), ("muse-", "meta"),                   # Meta
     ("nemotron-", "nemotron"),                               # NVIDIA
     ("mistral-", "mistral"),
     ("mercury-", "inception"),
     ("seed-", "seed"), ("doubao-", "seed"),                  # ByteDance Seed
     ("nova-", "nova"),                                       # Amazon
-    ("hy\\d", "hunyuan"), ("hunyuan-", "hunyuan"),             # Tencent
+    ("hy\\d[\\d.]*(?=[-:_+]|$)", "hunyuan"), ("hunyuan-", "hunyuan"),             # Tencent
     ("laguna-", "laguna"),                                   # Poolside
     ("ling-", "ling"),                                       # inclusionAI
     ("mimo-", "mimo"),                                       # Xiaomi

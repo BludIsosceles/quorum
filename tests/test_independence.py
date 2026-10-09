@@ -154,7 +154,8 @@ def label_contradicting_pin_refused(root):
     refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "liar", verifies="w"), "label vs pin")
 
 def unrecognised_model_refused(root):
-    for mid in ("zephyr-7b", "nemotronx", "some/new-model", "gptx", "opus-x", "swe-xyz", "codexified"):
+    for mid in ("zephyr-7b", "nemotronx", "some/new-model", "gptx", "opus-x", "swe-xyz", "codexified",
+                "gpt-5foo", "qwen3foo", "gemini-3foo", "grok-4x", "hy3x", "glm-5z", "swe-1x"):
         assert quorum.model_family(mid) == UNKNOWN, f"{mid!r} defaulted to {quorum.model_family(mid)!r}"
     o = setup(root); ROSTER["new"] = stub("new", "zephyr", "zephyr-7b")
     refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "new", verifies="w"), "id not in table")

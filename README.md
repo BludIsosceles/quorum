@@ -85,7 +85,7 @@ and so shared blind spots. Under that rule Gemma resolves `gemini`, Llama and Mu
 however the table grows (`UNRESOLVABLE`): a `stealth/` model has an undisclosed lab, and
 `mistral-nemotron` was trained jointly by two labs. Patterns are anchored (`gpt-\d`, not `gpt`),
 so an id that merely begins with a known name is not claimed. Since v0.3 the table covers every
-model the Decatron engine runs: 82 lanes, 25 labs.
+model the Decatron engine runs (82 lanes); the table names 22 labs.
 
 ## Probes record what they saw (v0.2)
 

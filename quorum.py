@@ -51,7 +51,7 @@ import sys
 import time
 from datetime import datetime, timezone
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 
 # --------------------------------------------------------------------- roster
@@ -105,22 +105,51 @@ MODEL_FLAGS = ("-m", "--model")
 ROUTED_ALIASES = {"auto", "ultimate", "performance", "efficient", "lite", "sonus",
                   "cantus", "adaptive", "fusion", "default"}
 
-# Model id -> family, by prefix of the normalised id (vendor prefix "x/" stripped).
-# First match wins. This table is data: an id it does not recognise resolves to
-# UNKNOWN and is refused, never defaulted. Extend it for your own lanes.
+# Model id -> family. A FAMILY IS THE LAB THAT TRAINED THE MODEL: same lab, same
+# data and habits, same blind spots. So Gemma is Google's and resolves gemini, Llama
+# and Muse are both Meta's, gpt-oss is OpenAI's. That is the conservative reading,
+# and the one this table already applied to Claude/Opus and to Kimi K2/K3.
+#
+# Each entry is a regex matched (re.match, so anchored at the start) against the
+# normalised id with any vendor prefix ("nvidia/", "kimi-code/") removed. v0.2.0
+# used bare startswith prefixes; "gpt", "opus" and "swe-" could claim ids they
+# merely prefix (grok-47 and gpt-5.6-luna reads), so patterns now end on a digit,
+# a separator, or the end of the id. First match wins. An id no entry matches is
+# UNKNOWN and refused, never defaulted. Extend it for your own lanes. Coverage was
+# extended 2026-10-09 to every pin the Decatron engine fields.
 MODEL_FAMILIES: list[tuple[str, str]] = [
-    ("qwen", "qwen"),
-    ("kimi", "k3"), ("k3", "k3"),            # Moonshot; K2.x and K3 are one family here
-    ("glm", "glm"),
-    ("deepseek", "deepseek"),
-    ("minimax", "minimax"),
-    ("gemini", "gemini"),
-    ("swe-", "swe"),
-    ("claude", "anthropic"), ("opus", "anthropic"), ("sonnet", "anthropic"),
-    ("haiku", "anthropic"), ("fable", "anthropic"),
-    ("gpt", "openai"), ("codex", "openai"),
-    ("grok", "grok"),
+    ("qwen\\d", "qwen"),
+    ("kimi-", "k3"), ("k3$", "k3"),                          # Moonshot; K2.x and K3 are one family
+    ("glm-\\d", "glm"),
+    ("deepseek-", "deepseek"),
+    ("minimax-", "minimax"),
+    ("gemini-\\d", "gemini"), ("gemma-\\d", "gemini"), ("diffusiongemma-", "gemini"),   # Google
+    ("swe(-\\d|$)", "swe"),                                    # Cognition; bare "swe" is an alias
+    ("claude-", "anthropic"), ("(opus|sonnet|haiku|fable)$", "anthropic"),
+    ("gpt-oss-", "openai"), ("gpt-\\d", "openai"), ("codex$", "openai"),
+    ("grok-\\d", "grok"),
+    ("llama-", "meta"), ("muse-", "meta"),                   # Meta
+    ("nemotron-", "nemotron"),                               # NVIDIA
+    ("mistral-", "mistral"),
+    ("mercury-", "inception"),
+    ("seed-", "seed"),                                       # ByteDance Seed
+    ("nova-", "nova"),                                       # Amazon
+    ("solar-", "solar"),                                     # Upstage
+    ("hy\\d", "hunyuan"), ("hunyuan-", "hunyuan"),             # Tencent
+    ("laguna-", "laguna"),                                   # Poolside
+    ("ling-", "ling"),                                       # inclusionAI
+    ("mimo-", "mimo"),                                       # Xiaomi
+    ("inkling$", "inkling"),                                 # Thinking Machines
 ]
+
+# Ids whose family cannot be established however the table grows. Checked first.
+UNRESOLVABLE: list[tuple[str, str]] = [
+    ("mistral-nemotron", "trained jointly by Mistral and NVIDIA, so it belongs to two families; "
+                         "independence from either cannot be shown"),
+]
+UNRESOLVABLE_VENDORS = {
+    "stealth": "a stealth model's lab is undisclosed by definition",
+}
 
 
 def norm(family: str) -> str:
@@ -142,19 +171,37 @@ def pinned_models(argv) -> list[str]:
     for a in it:
         if a in MODEL_FLAGS:
             out.append(next(it, ""))
-        elif a.startswith("--model="):
+        elif a.startswith(("--model=", "-m=")):
             out.append(a.split("=", 1)[1])
         elif UNPARSED_PIN.match(a):
             out.append(f"<unparsed {a!r}>")
     return out
 
 
+def _split(model: str) -> tuple[str, str]:
+    m = norm(model)
+    return (m.split("/", 1)[0] if "/" in m else ""), m.rsplit("/", 1)[-1]
+
+
+def unresolvable(model: str) -> str | None:
+    """Why this id can never resolve to a family, or None."""
+    vendor, tail = _split(model)
+    if vendor in UNRESOLVABLE_VENDORS:
+        return UNRESOLVABLE_VENDORS[vendor]
+    for pat, why in UNRESOLVABLE:
+        if re.match(pat, tail):
+            return why
+    return None
+
+
 def model_family(model: str) -> str:
-    m = norm(model).rsplit("/", 1)[-1]
-    if m in ROUTED_ALIASES:
+    vendor, tail = _split(model)
+    if tail in ROUTED_ALIASES:
         return ROUTED
-    for prefix, fam in MODEL_FAMILIES:
-        if m.startswith(norm(prefix)):
+    if unresolvable(model):
+        return UNKNOWN
+    for pat, fam in MODEL_FAMILIES:
+        if re.match(pat, tail):
             return fam
     return UNKNOWN
 
@@ -183,7 +230,9 @@ def resolve(h: "Harness") -> Resolution:
     if fam == ROUTED:
         return Resolution(ROUTED, model, f"pin {model!r} is a routed alias")
     if fam == UNKNOWN:
-        return Resolution(UNKNOWN, model, f"pin {model!r} is not in MODEL_FAMILIES")
+        why = unresolvable(model)
+        return Resolution(UNKNOWN, model, f"pin {model!r}: {why}" if why
+                          else f"pin {model!r} is not in MODEL_FAMILIES")
     if fam != declared:
         return Resolution(UNKNOWN, model,
                           f"declared {h.family!r} but pin {model!r} is family {fam!r}")
@@ -542,7 +591,9 @@ class Op:
         # A fixed threshold flagged a correct 14-byte answer as BLOCKED during
         # this module's own smoke test — a verification tool that cries wolf
         # gets ignored, which is the failure mode it exists to prevent.
-        blocked = size < min_bytes
+        # A timeout's partial output is not an answer, however long it is: it would
+        # otherwise become a job a later dispatch could verify (grok-47 read).
+        blocked = size < min_bytes or timed_out
         job = {"label": label, "harness": harness, "family": res.family, "model": res.model,
                "argv": list(h.argv), "sha": self._sha(out), "role": role, "timed_out": timed_out,
                "output": str(out), "bytes": size, "exit": code, "blocked": blocked,

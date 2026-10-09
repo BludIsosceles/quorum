@@ -149,10 +149,55 @@ def label_contradicting_pin_refused(root):
     refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "liar", verifies="w"), "label vs pin")
 
 def unrecognised_model_refused(root):
-    for mid in ("inkling", "nemotron-3-ultra", "some/new-model"):
+    for mid in ("zephyr-7b", "nemotronx", "some/new-model", "gptx", "opus-x", "swe-xyz", "codexified"):
         assert quorum.model_family(mid) == UNKNOWN, f"{mid!r} defaulted to {quorum.model_family(mid)!r}"
-    o = setup(root); ROSTER["new"] = stub("new", "inkling", "inkling")
+    o = setup(root); ROSTER["new"] = stub("new", "zephyr", "zephyr-7b")
     refuses(UnknownFamilyError, lambda: o.dispatch("m", "x", "new", verifies="w"), "id not in table")
+
+# Every pin the Decatron engine fielded on 2026-10-09 (decatron/lanes.json @49308b9),
+# with the family it must resolve to. "gemini" for Gemma, "meta" for Llama/Muse and
+# "openai" for gpt-oss are the lab rule, not the engine's labels.
+FLEET = {
+    "swe-1-7": "swe", "gemini-3.6-flash-high": "gemini", "Qwen3.8-Max": "qwen", "kimi-code/k3": "k3",
+    "kimi-code/kimi-for-coding": "k3", "meta/llama-3.1-70b-instruct": "meta", "openai/gpt-oss-120b": "openai",
+    "nvidia/nemotron-3-super-120b-a12b": "nemotron", "thinkingmachines/inkling": "inkling",
+    "nvidia/nemotron-3-ultra-550b-a55b": "nemotron", "nvidia/nemotron-3-ultra-550b-a55b:free": "nemotron",
+    "google/diffusiongemma-26b-a4b-it": "gemini", "nvidia/nemotron-3.5-lightning-30b-a3b": "nemotron",
+    "meta/muse-glimmer-30b": "meta", "poolside/laguna-s-2.1:free": "laguna", "inception/mercury-2.5": "inception",
+    "bytedance-seed/seed-1.6-flash": "seed", "bytedance-seed/seed-2-1-turbo": "seed", "gemma-4-31b-it": "gemini",
+    "inclusionai/ling-3.0-flash": "ling", "upstage/solar-pro4": "solar", "amazon/nova-lite-v1": "nova",
+    "xiaomi/mimo-v2.5": "mimo", "tencent/hy3": "hunyuan", "mistralai/mistral-large-4-0": "mistral",
+    "claude-opus-5-5": "anthropic", "gpt-6-astra": "openai", "gpt-5.3-codex": "openai", "grok-4.7": "grok",
+    "glm-5.3": "glm", "deepseek-v4-pro": "deepseek", "minimax-m3": "minimax", "Ultimate": ROUTED,
+    "stealth/ox-alpha": UNKNOWN, "mistralai/mistral-nemotron": UNKNOWN,
+}
+
+def fleet_coverage(root):
+    bad = {m: (quorum.model_family(m), f) for m, f in FLEET.items() if quorum.model_family(m) != f}
+    assert not bad, f"fleet pins resolve wrongly: {bad}"
+
+def unresolvable_ids_say_why(root):
+    for m, word in (("stealth/ox-alpha", "undisclosed"), ("stealth/claude-opus-5-5", "undisclosed"),
+                    ("mistralai/mistral-nemotron", "jointly")):
+        r = resolve(Harness("x", "glm", ["x", "--model", m], True, True, "free"))
+        assert r.family == UNKNOWN and word in r.why, (m, r)
+
+def lab_rule_merges(root):
+    for a, b in (("gemma-4-31b-it", "gemini-3.6-flash-high"), ("meta/muse-glimmer-30b", "meta/llama-3.1-70b-instruct"),
+                 ("openai/gpt-oss-120b", "gpt-6-astra"), ("kimi-code/kimi-for-coding", "kimi-code/k3")):
+        fa, fb = quorum.model_family(a), quorum.model_family(b)
+        assert fa == fb != UNKNOWN, f"{a}={fa} vs {b}={fb}: one lab, two families"
+
+def dash_m_equals_is_a_pin(root):
+    assert resolve(Harness("x", "qwen", ["x", "-m=Qwen3.8-Max"], True, True, "free")).family == "qwen"
+    assert resolve(Harness("x", "qwen", ["x", "-m", "Qwen3.8-Max", "-m=Kimi-K3"], True, True, "free")).family == UNKNOWN
+
+def timed_out_output_is_blocked(root):
+    ROSTER["chatty"] = stub("chatty", "stuba", "stuba-1", "yes partial-answer | head -c 5000; sleep 120 #{prompt}")
+    MODEL_FAMILIES[:0] = [("stuba-", "stuba")]
+    j = Op("t7", root=root).dispatch("c", "x", "chatty", timeout=2, min_bytes=10)
+    assert j["timed_out"] and j["bytes"] >= 10, j
+    assert j["blocked"], "a timed-out partial answer over min_bytes was not blocked"
 
 # --- the record is not trusted over the roster -------------------------------------------
 def edited_job_record_refused(root):
@@ -250,10 +295,22 @@ def timeout_kills_process_group(root):
     raise AssertionError(f"grandchild {pid} survived the timeout")
 
 def stdin_is_closed(root):
-    ROSTER["cat"] = stub("cat", "stuba", "stuba-1", "cat; echo read-done #{prompt}")
-    j = Op("t4", root=root).dispatch("c", "x", "cat", timeout=10, min_bytes=1)
-    assert not j["timed_out"] and "read-done" in pathlib.Path(j["output"]).read_text(), \
-        "a dispatch reading stdin hung"
+    # Asserts WHAT stdin is, not merely that `cat` returned: when the suite itself
+    # runs with stdin on /dev/null, an inherited stdin also returns at once, and the
+    # v3 form of this test passed with the protection removed.
+    ROSTER["cat"] = stub("cat", "stuba", "stuba-1",
+                         "echo stdin=$(readlink /proc/$$/fd/0); cat; echo read-done #{prompt}")
+    # Point THIS process's stdin at an open pipe, so an inherited stdin would be
+    # that pipe (and `cat` would block) whatever stdin the suite was started with.
+    r, w = os.pipe(); saved = os.dup(0); os.dup2(r, 0)
+    try:
+        j = Op("t4", root=root).dispatch("c", "x", "cat", timeout=10, min_bytes=1)
+    finally:
+        os.dup2(saved, 0); os.close(saved); os.close(r); os.close(w)
+    out = pathlib.Path(j["output"]).read_text()
+    assert not j["timed_out"] and "read-done" in out, "a dispatch reading stdin hung"
+    if pathlib.Path("/proc/self/fd/0").exists():
+        assert "stdin=/dev/null" in out, f"child stdin was not /dev/null: {out.splitlines()[:1]}"
 
 # --- probes recognise, they do not trust exit 0 ------------------------------------------
 def probe_needs_positive_recognition(root):
@@ -298,6 +355,11 @@ for n, f in [
     ("odd pin spellings make the pin unknown",      odd_pin_spellings_refused),
     ("label contradicting pin refused [Unknown]",   label_contradicting_pin_refused),
     ("unrecognised model id refused [Unknown]",     unrecognised_model_refused),
+    ("engine fleet pins all resolve as ruled",      fleet_coverage),
+    ("unresolvable ids say why",                    unresolvable_ids_say_why),
+    ("one lab is one family",                       lab_rule_merges),
+    ("-m=ID is a pin",                              dash_m_equals_is_a_pin),
+    ("timed-out partial output is BLOCKED",         timed_out_output_is_blocked),
     ("edited job record refused [Mismatch]",        edited_job_record_refused),
     ("hand-written routed record refused",          handwritten_routed_record_refused),
     ("producer re-pointed between dispatches",      producer_repointed_between_dispatches),

@@ -54,8 +54,8 @@ lane, and the guard passed, because it compared strings nobody had checked. One 
 our box serves Claude, GPT, Gemini, Grok, Kimi, GLM and DeepSeek behind a single binary, so
 neither the binary nor the label says which model answers.
 
-The family is now **resolved from the model pinned in argv** (`-m`/`--model`) via a prefix table
-(`MODEL_FAMILIES`), and the label must agree with it. A lane is refused **on either side** of a
+The family is now **resolved from the model pinned in argv** (`-m ID`, `-m=ID`, `--model ID`,
+`--model=ID`) through a pattern table (`MODEL_FAMILIES`), and the label must agree with it. A lane is refused **on either side** of a
 verification when it is:
 
 | Resolves to | When | Refusal |
@@ -78,6 +78,14 @@ sets the orchestrator family.
 **Fail closed is deliberate.** An unknown model id is never defaulted to a family. The shipped
 `kimi` lane has no pin, so it now works as a producer but cannot sit on either side of a
 verification. Extend `MODEL_FAMILIES` for your own models.
+
+**A family is the lab that trained the model (v0.3).** Same lab means shared data and habits,
+and so shared blind spots. Under that rule Gemma resolves `gemini`, Llama and Muse are both
+`meta`, gpt-oss is `openai`, and Kimi K2 and K3 are one family. Some ids can never resolve,
+however the table grows (`UNRESOLVABLE`): a `stealth/` model has an undisclosed lab, and
+`mistral-nemotron` was trained jointly by two labs. Patterns are anchored (`gpt-\d`, not `gpt`),
+so an id that merely begins with a known name is not claimed. Since v0.3 the table covers every
+model the Decatron engine runs: 82 lanes, 25 labs.
 
 ## Probes record what they saw (v0.2)
 

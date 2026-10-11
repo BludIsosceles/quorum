@@ -385,6 +385,26 @@ def probe_without_recipe_is_declared_only(root):
     assert o.probe(["s"]) == {"s": False}, "no-recipe lane passed as if exercised"
     assert o.probe(["s"], allow_declared=True) == {"s": True}, "allow_declared ignored"
 
+def probe_web_required_needs_declared_web(root):
+    # the failure the probe exists for: an operation planned around web access the lane does not have
+    fake = pathlib.Path(root) / "webcli"
+    fake.write_text("#!/bin/sh\necho MODEL\necho stuba-1\n"); fake.chmod(0o755)
+    MODEL_FAMILIES[:0] = [("stuba-", "stuba")]
+    PROBE_RECIPES[str(fake)] = [("model-offered", [str(fake)], "{model}")]
+    ROSTER["nw"] = Harness("nw", "stuba", [str(fake), "--model", "stuba-1"], False, True, "free")   # no web
+    ROSTER["w"] = Harness("w", "stuba", [str(fake), "--model", "stuba-1"], True, True, "free")
+    o = Op("t8", root=root)
+    assert o.probe(["w"], need_web=True) == {"w": True}, "control: a web lane with a live recipe failed"
+    assert o.probe(["nw"], need_web=True) == {"nw": False}, "a lane with no web access passed a web-required probe"
+    assert o.probe(["nw"]) == {"nw": True}, "control: the same lane without need_web failed"
+
+def probe_missing_binary_fails_not_crashes(root):
+    ROSTER["gone"] = Harness("gone", "stuba", [str(pathlib.Path(root) / "no-such-cli"), "--model", "stuba-1"], True, True, "free")
+    MODEL_FAMILIES[:0] = [("stuba-", "stuba")]
+    o = Op("t9", root=root)
+    assert o.probe(["gone"], allow_declared=True) == {"gone": False}, "a missing binary passed"
+
+
 print("quorum guard tests (v3)")
 for n, f in [
     ("stub harness is runnable",                    stub_is_runnable),
@@ -431,6 +451,8 @@ for n, f in [
     ("stdin closed: no dispatch hangs on input",    stdin_is_closed),
     ("probe: exit 0 is not a pass",                 probe_needs_positive_recognition),
     ("probe: no recipe = declared only",            probe_without_recipe_is_declared_only),
+    ("probe: web required needs declared web",      probe_web_required_needs_declared_web),
+    ("probe: a missing binary fails, not crashes",  probe_missing_binary_fails_not_crashes),
 ]:
     run(n, f)
 print(f"\n{'ALL PASS' if not FAILS else 'FAILURES: ' + ', '.join(FAILS)}")

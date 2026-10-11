@@ -267,6 +267,10 @@ def output_deleted_after_production_refused(root):
     o = setup(root); pathlib.Path(o.jobs["w"]["output"]).unlink()
     refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="w"), "output deleted")
 
+def output_that_is_a_directory_refused(root):
+    o = setup(root); j = dict(o.jobs["w"], output=root); o.jobs["d"] = j      # a path, but not the work
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="d"), "output is a directory")
+
 def check_cli_unknown_harness_is_a_usage_refusal(root):
     r = subprocess.run([sys.executable, str(QDIR / "quorum.py"), "--check", "no-such-lane", "qwen"],
                        capture_output=True, text=True)
@@ -416,6 +420,7 @@ for n, f in [
     ("producer harness not in roster [Mismatch]",   harness_not_in_roster_refused),
     ("record without sha refused [Mismatch]",       record_without_sha_refused),
     ("output deleted after production [Mismatch]",  output_deleted_after_production_refused),
+    ("output that is a directory [Mismatch]",       output_that_is_a_directory_refused),
     ("--check unknown harness exits 2",             check_cli_unknown_harness_is_a_usage_refusal),
     ("--check is the dispatch rule",                check_cli_matches_dispatch),
     ("vet() takes no pre-built Resolution",         vet_takes_no_prebuilt_resolution),

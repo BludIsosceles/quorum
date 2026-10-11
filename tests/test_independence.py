@@ -255,6 +255,23 @@ def unknown_target_refused(root):
     except KeyError:
         pass
 
+def harness_not_in_roster_refused(root):
+    o = setup(root); o.jobs["g"] = dict(o.jobs["w"], harness="ghost-lane")      # a1-r7: the class is the contract
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="g"), "producer harness not in roster")
+
+def record_without_sha_refused(root):
+    o = setup(root); j = dict(o.jobs["w"]); del j["sha"]; o.jobs["s"] = j
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="s"), "record with no sha")
+
+def output_deleted_after_production_refused(root):
+    o = setup(root); pathlib.Path(o.jobs["w"]["output"]).unlink()
+    refuses(RecordMismatchError, lambda: o.dispatch("m", "x", "b", verifies="w"), "output deleted")
+
+def check_cli_unknown_harness_is_a_usage_refusal(root):
+    r = subprocess.run([sys.executable, str(QDIR / "quorum.py"), "--check", "no-such-lane", "qwen"],
+                       capture_output=True, text=True)
+    assert r.returncode == 2 and "unknown harness" in r.stdout, (r.returncode, r.stdout[-200:], r.stderr[-200:])
+
 # --- the CLI gate is the same gate -------------------------------------------------------
 def check_cli_matches_dispatch(root):
     def cli(*a):
@@ -396,6 +413,10 @@ for n, f in [
     ("forged record without argv refused",          forged_record_without_argv_refused),
     ("output changed after production refused",     output_changed_after_production_refused),
     ("unknown verify target refused",               unknown_target_refused),
+    ("producer harness not in roster [Mismatch]",   harness_not_in_roster_refused),
+    ("record without sha refused [Mismatch]",       record_without_sha_refused),
+    ("output deleted after production [Mismatch]",  output_deleted_after_production_refused),
+    ("--check unknown harness exits 2",             check_cli_unknown_harness_is_a_usage_refusal),
     ("--check is the dispatch rule",                check_cli_matches_dispatch),
     ("vet() takes no pre-built Resolution",         vet_takes_no_prebuilt_resolution),
     ("refusal suggestions are usable",              suggestions_are_usable),
